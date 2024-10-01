@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 set(CMAKE_CXX_STANDARD 17)
+# message (STATUS "CMAKE_C: ${CMAKE_C_COMPILER}")
+# message (STATUS "CMAKE_CXX: ${CMAKE_CXX_COMPILER}")
+# message (STATUS ${CMAKE_CXX_COMPILER_AR})
+# message (STATUS ${CMAKE_CXX_COMPILER_RANLIB})
 project(learn_mpc)
 
 # Library definition
@@ -18,7 +22,7 @@ target_link_libraries(METAL_CPP
         "-framework Metal"
         # "-framework MetalKit"
         # "-framework AppKit"
-        # "-framework Foundation"
+        "-framework Foundation"
         # "-framework QuartzCore"
         )
 
