@@ -1,1 +1,15 @@
+# Ignore all
+*
+
+# Unignore all with extensions
+!*.*
+!*/
+
+*.a
 *.out
+CMakeFiles
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+.DS_Store
+metal-cpp
