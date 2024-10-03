@@ -85,9 +85,10 @@ int main() {
     // Allocate buffers to input and output image. Input image is 3 channels while output is 1
     unsigned char * img, * out;
     size_t w, h, size;
+    unsigned char chan;
 
     // Read image with a helper function
-    tie(img, w, h) = imRead();
+    tie(img, w, h, chan) = imRead("data/lion.jpg");
     
     size = w * h;
     // Allocate data to the output based on the size of the image. Single channel so (w * h * 1)
@@ -95,7 +96,7 @@ int main() {
     // call the kernel caller
     toGray2D(img, out, w, h);
     // helper function to save the result
-    gray(out, w, h);
+    jpeg_write(out, w, h, chan, "data/lion-grey-metal.jpg");
     // Free the allocations
     free(img);
     free(out);
