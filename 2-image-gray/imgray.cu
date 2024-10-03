@@ -67,7 +67,7 @@ void toGray2D(
         // Freeing the cuda allocations to the pool
         cudaFree(I_d);
         cudaFree(O_d);
-    }
+}
 
 int main() {
     // Allocate buffers to input and output image. Input image is 3 channels while output is 1

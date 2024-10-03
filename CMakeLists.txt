@@ -39,6 +39,20 @@ IF(IS_DIRECTORY ${EXAMPLE})
     add_executable(${project_name}-out ${SRC})
     message(STATUS "Linking ${METAL_CPP}")
     target_link_libraries(${project_name}-out METAL_CPP)
+    # Find the JPEG package
+    find_package(JPEG REQUIRED)
+    # If find_package doesn't work, you can set paths manually:
+    if(NOT JPEG_FOUND)
+        set(JPEG_INCLUDE_DIR "/usr/local/opt/jpeg/include")
+        set(JPEG_LIBRARY "/usr/local/opt/jpeg/lib/libjpeg.dylib")
+        # For Apple Silicon Macs, you might need to use:
+        # set(JPEG_INCLUDE_DIR "/opt/homebrew/opt/jpeg/include")
+        # set(JPEG_LIBRARY "/opt/homebrew/opt/jpeg/lib/libjpeg.dylib")
+    endif()
+    
+    # Add the include directories
+    include_directories(${JPEG_INCLUDE_DIR})
+    target_link_libraries(${project_name}-out ${JPEG_LIBRARY})
 
     message(STATUS "Adding ${project_name}")
 ENDIF()

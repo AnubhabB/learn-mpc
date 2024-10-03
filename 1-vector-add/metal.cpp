@@ -43,9 +43,11 @@ void vecAdd(float *A_h, float *B_h, float *C_h, int n) {
     const size_t size = n * sizeof(float);
 
     // Create some new buffers, A_d, B_d are inputs and C_d are the outputs
-    MTL::Buffer* A_d = device->newBuffer(size, MTL::ResourceStorageModeManaged);
-    MTL::Buffer* B_d = device->newBuffer(size, MTL::ResourceStorageModeManaged);
-    MTL::Buffer* C_d = device->newBuffer(size, MTL::ResourceStorageModeManaged);
+    MTL::Buffer* A_d = device->newBuffer(A_h, size, MTL::ResourceStorageModeShared);
+    MTL::Buffer* B_d = device->newBuffer(B_h, size, MTL::ResourceStorageModeShared);
+    MTL::Buffer* C_d = device->newBuffer(size, MTL::ResourceStorageModeShared);
+    MTL::Buffer* N = device->newBuffer(&n, sizeof(n), MTL::ResourceStorageModeShared);
+    
 
     // Create a command buffer and a compute encoder from the buffer
     MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
@@ -56,22 +58,24 @@ void vecAdd(float *A_h, float *B_h, float *C_h, int n) {
     cmdEncoder->setBuffer(A_d, 0, 0);
     cmdEncoder->setBuffer(B_d, 0, 1);
     cmdEncoder->setBuffer(C_d, 0, 2);
+    cmdEncoder->setBuffer(N, 0, 3);
     
     // Calculate the launch template
     MTL::Size gridSize = MTL::Size::Make(n, 1, 1);
-    MTL::Size threadGroupSize;
-
-    if(_pState->maxTotalThreadsPerThreadgroup() > n) {
-        threadGroupSize = MTL::Size::Make(n, 1, 1);
-    } else {
-        threadGroupSize = MTL::Size::Make(_pState->maxTotalThreadsPerThreadgroup(), 1, 1);
+    size_t tgs = _pState->maxTotalThreadsPerThreadgroup();
+    if ( tgs > n ) {
+        tgs = n;
     }
+    MTL::Size threadGroupSize = MTL::Size::Make(tgs, 1, 1);
 
     // Execute the kernel
     cmdEncoder->dispatchThreads(gridSize, threadGroupSize);
     cmdEncoder->endEncoding();
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
+
+    std::memcpy(C_h, C_d->contents(), size);
+    
 
     vecAdd->release();
     library->release();
@@ -96,10 +100,13 @@ int main() {
 
     // Check if all is well
     for (int i=0; i < size; i ++) {
-        if ( C[i] != 5. ) {
+        if ( C[i] != 5.0 ) {
+            printf("Error! %f %f %f", A[i], B[i], C[i]);
             return 1;
         }
     }
+
+    printf("Checks passed!");
 
     free(A);
     free(B);
