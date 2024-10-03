@@ -5,17 +5,18 @@
 
 using namespace std;
 
-tuple<unsigned char*, unsigned long, unsigned long> imRead() {
+tuple<unsigned char*, unsigned long, unsigned long, unsigned char> imRead(const char path[]) {
     struct jpeg_decompress_struct info; //for our jpeg info
     struct jpeg_error_mgr err;          //the error handler
     
     unsigned long x, y; // width and height of image
     unsigned long data_size; // length of the file
+    unsigned char channels;
     unsigned char* imgdata; // data for the image
 
     unsigned char * rowptr[1];    // pointer to an array
 
-    FILE *file = fopen("data/lion.jpg","r");
+    FILE *file = fopen(path,"r");
 
     info.err = jpeg_std_error(& err);     
     jpeg_create_decompress(& info);
@@ -23,7 +24,7 @@ tuple<unsigned char*, unsigned long, unsigned long> imRead() {
     //if the jpeg file doesn't load
     if(!file) {
         fprintf(stderr, "Error reading JPEG file!");
-        return { nullptr, 0, 0 };
+        return { nullptr, 0, 0, 0 };
     }
     
     jpeg_stdio_src(&info, file);
@@ -34,6 +35,8 @@ tuple<unsigned char*, unsigned long, unsigned long> imRead() {
     //set width and height
     x = info.output_width;
     y = info.output_height;
+    channels = info.jpeg_color_space;
+    
     data_size = x * y * 3;
 
     imgdata = (unsigned char *)malloc(data_size);
@@ -50,11 +53,11 @@ tuple<unsigned char*, unsigned long, unsigned long> imRead() {
     jpeg_destroy_decompress(&info);
     fclose(file);                    //close the file
 
-    return { imgdata, x, y };
+    return { imgdata, x, y, channels };
 }
 
 // copied from: https://github.com/LuaDist/libjpeg/blob/master/example.c
-void gray(unsigned char* img, unsigned long w, unsigned long h) {
+void jpeg_write(unsigned char* img, unsigned long w, unsigned long h, int chan, const char path[]) {
     /* This struct contains the JPEG compression parameters and pointers to
     * working space (which is allocated as needed by the JPEG library).
     * It is possible to have several such structures, representing multiple
@@ -96,8 +99,8 @@ void gray(unsigned char* img, unsigned long w, unsigned long h) {
     * requires it in order to write binary files.
     */
 
-    if ((outfile = fopen("data/gray.jpeg", "wb")) == NULL) {
-        fprintf(stderr, "can't open \"data/gray.jpeg\"\n");
+    if ((outfile = fopen(path, "wb")) == NULL) {
+        fprintf(stderr, "can't open %s\n", path);
         exit(1);
     }
     jpeg_stdio_dest(&cinfo, outfile);
@@ -109,8 +112,11 @@ void gray(unsigned char* img, unsigned long w, unsigned long h) {
     */
     cinfo.image_width = w; 	/* image width and height, in pixels */
     cinfo.image_height = h;
-    cinfo.input_components = 1;		/* # of color components per pixel */
+    cinfo.input_components = chan;		/* # of color components per pixel */
     cinfo.in_color_space = JCS_GRAYSCALE; 	/* colorspace of input image */
+    if(chan == 3) {
+        cinfo.in_color_space = JCS_RGB;
+    }
     /* Now use the library's routine to set default compression parameters.
     * (You must set at least cinfo.in_color_space before calling this,
     * since the defaults depend on the source color space.)
@@ -136,7 +142,7 @@ void gray(unsigned char* img, unsigned long w, unsigned long h) {
     * To keep things simple, we pass one scanline per call; you can pass
     * more if you wish, though.
     */
-    row_stride = w;	/* JSAMPLEs per row in image_buffer */
+    row_stride = w * chan;	/* JSAMPLEs per row in image_buffer */
 
     while (cinfo.next_scanline < cinfo.image_height) {
         /* jpeg_write_scanlines expects an array of pointers to scanlines.

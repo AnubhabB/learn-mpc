@@ -15,7 +15,7 @@ __global__ void toGrayKernel(
     size_t row = blockDim.y * blockIdx.y + threadIdx.y;
 
     // Bail if we have a column/ row greater than the width and height of the image
-    if ( row >= h || col >= w) {
+    if ( !(row < h && col < w)) {
         return;
     }
 
@@ -72,10 +72,10 @@ void toGray2D(
 int main() {
     // Allocate buffers to input and output image. Input image is 3 channels while output is 1
     unsigned char * img, * out;
-    size_t w, h, size;
+    size_t w, h, size, chan;
 
     // Read image with a helper function
-    tie(img, w, h) = imRead();
+    tie(img, w, h, chan) = imRead("data/lion.jpg");
     
     size = w * h;
     // Allocate data to the output based on the size of the image. Single channel so (w * h * 1)
@@ -83,7 +83,7 @@ int main() {
     // call the kernel caller
     toGray2D(img, out, w, h);
     // helper function to save the result
-    gray(out, w, h);
+    jpeg_write(out, w, h, 1, "data/gray-lion.jpg");
     // Free the allocations
     free(img);
     free(out);
