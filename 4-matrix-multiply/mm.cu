@@ -24,10 +24,6 @@ __global__ void mmPerElem(
     for(int i=0; i<N; i++) {
         size_t a_item = row * N + i;
         size_t b_item = col + P * i;
-
-        // if(row == 2) {
-        //     printf("[%lu %lu %d]: A[%lu %f] B[%lu %f] | ", row, col, i, a_item, A[a_item], b_item, B[b_item]);
-        // }
         
         v += A[a_item] * B[b_item];
     }
