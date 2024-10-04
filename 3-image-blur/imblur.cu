@@ -14,8 +14,8 @@ __global__ void naiveBlurKernel(
     if ( !(row < h && col < w)) {
         return;
     }
-    // printf("%lu %lu\n", col, row);
-    // cudaError_t e = cudaMalloc((void**)&vals, chan * sizeof(int));
+
+
     float r = 0.;
     float g = 0.;
     float b = 0.; 
