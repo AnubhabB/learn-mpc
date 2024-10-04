@@ -6,7 +6,7 @@ __global__ void naiveBlurKernel(
     const int RADIUS,
     const size_t w,
     const size_t h,
-    const size_t chan
+    const unsigned char chan
 ) {
     size_t col = blockDim.x * blockIdx.x + threadIdx.x;
     size_t row = blockDim.y * blockIdx.y + threadIdx.y;

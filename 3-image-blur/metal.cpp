@@ -47,15 +47,17 @@ void naiveBlur(
     // Calculate the size in bits of the vector -
     // in this case since this `O` is `unsigned char`
     // `I` on the other hand is also `unsigned char` but has 3 channels per pixel - RGB
-    const size_t size = w * h * sizeof(unsigned char) * chan;
+    const size_t true_w = w * chan;
+    const size_t size = true_w * h * sizeof(unsigned char);
+    
 
     // Create some new buffers, A_d, B_d are inputs and C_d are the outputs
     MTL::Buffer* I_d = device->newBuffer(I_h, size, MTL::ResourceStorageModeManaged);
     MTL::Buffer* O_d = device->newBuffer(size, MTL::ResourceStorageModeManaged);
-    MTL::Buffer* W_d = device->newBuffer(&w, sizeof(size_t), MTL::ResourceStorageModeManaged);
+    MTL::Buffer* W_d = device->newBuffer(&true_w, sizeof(size_t), MTL::ResourceStorageModeManaged);
     MTL::Buffer* H_d = device->newBuffer(&h, sizeof(size_t), MTL::ResourceStorageModeManaged);
-    MTL::Buffer* C_d = device->newBuffer(&chan, sizeof(unsigned char), MTL::ResourceStorageModeManaged);
     MTL::Buffer* R_d = device->newBuffer(&radius, sizeof(int), MTL::ResourceStorageModeManaged);
+    MTL::Buffer* C_d = device->newBuffer(&chan, sizeof(unsigned char), MTL::ResourceStorageModeManaged);
 
     // Create a command buffer and a compute encoder from the buffer
     MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
@@ -71,12 +73,20 @@ void naiveBlur(
     cmdEncoder->setBuffer(C_d, 0, 5);
     
     // Calculate the launch template
-    size_t maxthreads = sqrt(_pState->maxTotalThreadsPerThreadgroup());
-    MTL::Size threadsPerThreadgroup = MTL::Size::Make(maxthreads, maxthreads, 1);
-    MTL::Size threadsPerGrid = MTL::Size::Make(w, h, 1);
+    size_t maxThreadsPerThreadgroup = _pState->maxTotalThreadsPerThreadgroup();
+
+    // Calculate optimal thread group size
+    size_t threadGroupWidth = std::min(static_cast<size_t>(32), true_w);
+    size_t threadGroupHeight = std::min(maxThreadsPerThreadgroup / threadGroupWidth, h);
+    MTL::Size threadsPerThreadgroup = MTL::Size::Make(threadGroupWidth, threadGroupHeight, 1);
+
+    // Calculate grid size
+    size_t gridWidth = (true_w + threadGroupWidth - 1) / threadGroupWidth;
+    size_t gridHeight = (h + threadGroupHeight - 1) / threadGroupHeight;
+    MTL::Size gridSize = MTL::Size::Make(gridWidth, gridHeight, 1);
 
     // Execute the kernel
-    cmdEncoder->dispatchThreads(threadsPerGrid, threadsPerThreadgroup);
+    cmdEncoder->dispatchThreadgroups(gridSize, threadsPerThreadgroup);
     cmdEncoder->endEncoding();
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
@@ -91,13 +101,14 @@ void naiveBlur(
 int main() {
     const int RADIUS = 64;
     // Allocate buffers to input and output image. Input image is 3 channels while output is 1
-    unsigned char * img, * out;
-    size_t w, h, size, chan;
+    unsigned char *img, *out, chan;
+    size_t w, h, size;
 
     // Read image with a helper function
     tie(img, w, h, chan) = imRead("data/gray-lion.jpg");
 
     size = w * h;
+    printf("Gray lion: %lu %lu %d\n", w, h, chan);
     // Allocate data to the output based on the size of the image. Single channel so (w * h * 1)
     out = (unsigned char*)malloc(size * chan * sizeof(unsigned char));
     // call the kernel caller
@@ -112,6 +123,7 @@ int main() {
     tie(img, w, h, chan) = imRead("data/lion.jpg");
 
     size = w * h;
+    printf("RGB lion: %lu %lu %d\n", w, h, chan);
     // Allocate data to the output based on the size of the image. Single channel so (w * h * 1)
     out = (unsigned char*)malloc(size * chan * sizeof(unsigned char));
     // call the kernel caller

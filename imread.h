@@ -37,14 +37,14 @@ tuple<unsigned char*, unsigned long, unsigned long, unsigned char> imRead(const 
     y = info.output_height;
     channels = info.jpeg_color_space;
     
-    data_size = x * y * 3;
+    data_size = x * y * channels;
 
     imgdata = (unsigned char *)malloc(data_size);
     while (info.output_scanline < info.output_height) // loop
     {
         // Enable jpeg_read_scanlines() to fill our jdata array
         rowptr[0] = (unsigned char *)imgdata +  // secret to method
-                3* info.output_width * info.output_scanline; 
+                channels * info.output_width * info.output_scanline; 
 
         jpeg_read_scanlines(&info, rowptr, 1);
     }
