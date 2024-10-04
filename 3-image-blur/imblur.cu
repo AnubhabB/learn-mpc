@@ -3,9 +3,9 @@
 __global__ void naiveBlurKernel(
     const unsigned char* I,
     unsigned char* O,
-    const int RADIUS,
     const size_t w,
     const size_t h,
+    const int radius,
     const unsigned char chan
 ) {
     size_t col = blockDim.x * blockIdx.x + threadIdx.x;
@@ -15,50 +15,25 @@ __global__ void naiveBlurKernel(
         return;
     }
 
-
-    float r = 0.;
-    float g = 0.;
-    float b = 0.; 
-
+    unsigned int px_val = 0;
     float px_count = 0.;
 
     // (col: 1, row: 1)
     // (row * w + col, row * w + col + 1, row * w + col + 2)
-    for(int blurRow = -RADIUS; blurRow < RADIUS + 1; blurRow++) {
-        for(int blurCol = -RADIUS; blurCol < RADIUS + 1; blurCol++) {
+    for(int blurRow = -radius; blurRow < radius + 1; blurRow++) {
+        for(int blurCol = -radius * chan; blurCol < radius * chan + 1; blurCol += chan) {
             int curRow = row + blurRow;
             int curCol = col + blurCol;
 
             if(curRow >= 0 && curRow < h && curCol >= 0 && curCol < w) {
-                size_t at = (curRow * w + curCol) * chan;
-                for(int i=0; i<chan; i++) {
-                    if(i == 0) {
-                        r += (float) I[at];
-                    } else if(i == 1) {
-                        g += (float) I[at + 1];
-                    } else if(i == 2) {
-                        b += (float) I[at + 2];
-                    }
-                }
-                
+                size_t at = curRow * w + curCol;
+                px_val += static_cast<unsigned int>(I[at]);
                 ++px_count;
             }
         }
     }
 
-    size_t trg = (row * w + col) * chan;
-    for(int i=0; i<chan; i++) {
-        int v;
-        if(i == 0) {
-            v = r;
-        } else if(i == 1) {
-            v = g;
-        } else if(i == 2) {
-            v = b;
-        }
-
-        O[trg + i] = (unsigned char) round(v / px_count);
-    }
+    O[(row * w + col)] = static_cast<unsigned char>(round(px_val / px_count));
 }
 
 void naiveBlur(
@@ -67,7 +42,7 @@ void naiveBlur(
     size_t w,
     size_t h,
     const int radius,
-    size_t chan
+    const unsigned char chan
 ) {
         cudaError_t e;
         // declare the device input and output
@@ -76,7 +51,8 @@ void naiveBlur(
 
         // The dimensions of the image
         // Output is single channel
-        size_t size = w * h * sizeof(unsigned char) * chan;
+        size_t true_w = w * chan;
+        size_t size = true_w * h * sizeof(unsigned char);
 
         // Allocating device memory for input and output
         e = cudaMalloc((void**)&I_d, size);
@@ -99,13 +75,15 @@ void naiveBlur(
 
         // Gets interesting here - we are using a 2d grid blocks
         // Max number of threads per block is capped at 1024 - so we are defining 32 * 32 * 1 size of threads in block
-        dim3 threadsPerBlock = dim3(32, 32, 1);
+        dim3 threadsPerBlock(32, 32, 1);
         // Since we are capping the threads per block along x at 32 - we are saying that our max blocks x would be ceil(w / 32)
         // Again, since we have 32 threads along y dim of a block we are capping the num blocks across y dim at ceil(h / 32)
-        dim3 numBlocks = dim3(ceil(w / 32), ceil(h / 32), 1);
+        dim3 numBlocks(static_cast<size_t>(ceil(static_cast<float>(true_w) / threadsPerBlock.x)),
+               static_cast<size_t>(ceil(static_cast<float>(h) / threadsPerBlock.y)));
+        // dim3 numBlocks = dim3(ceil(w / 32), ceil(h / 32), 1);
 
         // Calling the kernel with these settings
-        naiveBlurKernel<<< numBlocks, threadsPerBlock>>>(I_d, O_d, radius, w, h, chan);
+        naiveBlurKernel<<<numBlocks, threadsPerBlock>>>(I_d, O_d, true_w, h, radius, chan);
         
         // Copying the device output result back to host output
         e = cudaMemcpy(O_h, O_d, size, cudaMemcpyDeviceToHost);
@@ -122,8 +100,8 @@ void naiveBlur(
 int main() {
     const int RADIUS = 64;
     // Allocate buffers to input and output image. Input image is 3 channels while output is 1
-    unsigned char * img, * out;
-    size_t w, h, size, chan;
+    unsigned char * img, * out, chan;
+    size_t w, h, size;
 
     // Read image with a helper function
     tie(img, w, h, chan) = imRead("data/gray-lion.jpg");
@@ -134,7 +112,7 @@ int main() {
     // call the kernel caller
     naiveBlur(img, out, w, h, RADIUS, chan);
     // helper function to save the result
-    jpeg_write(out, w, h, chan, "data/blur-lion-grey.jpg");
+    jpeg_write(out, w, h, chan, "data/blur-lion-grey-c.jpg");
     // Free the allocations
     free(img);
     free(out);
@@ -148,7 +126,7 @@ int main() {
     // call the kernel caller
     naiveBlur(img, out, w, h, RADIUS, chan);
     // helper function to save the result
-    jpeg_write(out, w, h, chan, "data/blur-lion.jpg");
+    jpeg_write(out, w, h, chan, "data/blur-lion-c.jpg");
     // Free the allocations
     free(img);
     free(out);

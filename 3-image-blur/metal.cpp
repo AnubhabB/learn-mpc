@@ -77,12 +77,12 @@ void naiveBlur(
 
     // Calculate optimal thread group size
     size_t threadGroupWidth = std::min(static_cast<size_t>(32), true_w);
-    size_t threadGroupHeight = std::min(maxThreadsPerThreadgroup / threadGroupWidth, h);
+    size_t threadGroupHeight = std::min(ceil(maxThreadsPerThreadgroup / threadGroupWidth), h);
     MTL::Size threadsPerThreadgroup = MTL::Size::Make(threadGroupWidth, threadGroupHeight, 1);
 
     // Calculate grid size
-    size_t gridWidth = (true_w + threadGroupWidth - 1) / threadGroupWidth;
-    size_t gridHeight = (h + threadGroupHeight - 1) / threadGroupHeight;
+    size_t gridWidth = ceil((true_w + threadGroupWidth - 1) / threadGroupWidth);
+    size_t gridHeight = ceil((h + threadGroupHeight - 1) / threadGroupHeight);
     MTL::Size gridSize = MTL::Size::Make(gridWidth, gridHeight, 1);
 
     // Execute the kernel
