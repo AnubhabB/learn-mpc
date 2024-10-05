@@ -24,7 +24,6 @@ __global__ void naive(
     for(int i=0; i<N; i++) {
         size_t a_item = row * N + i;
         size_t b_item = col + P * i;
-
         v += A[a_item] * B[b_item];
     }
 
