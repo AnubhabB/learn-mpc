@@ -6,7 +6,7 @@
 [4, 5, 6]   [3, 4]   [49,  64]
 [7, 8, 9]   [5, 6]   [76, 100]
 */
-__global__ void mmPerElem(
+__global__ void naive(
     const float *A,
     const float *B,
     float *C,
@@ -25,10 +25,6 @@ __global__ void mmPerElem(
         size_t a_item = row * N + i;
         size_t b_item = col + P * i;
 
-        // if(row == 2) {
-        //     printf("[%lu %lu %d]: A[%lu %f] B[%lu %f] | ", row, col, i, a_item, A[a_item], b_item, B[b_item]);
-        // }
-        
         v += A[a_item] * B[b_item];
     }
 
@@ -38,7 +34,7 @@ __global__ void mmPerElem(
 int main() {
     const size_t M = 2048;
     const size_t N = 4096;
-    const size_t P = 1024;
+    const size_t P = 2048;
 
     float *A_d, *B_d, *C_d;
 
@@ -65,7 +61,7 @@ int main() {
     dim3 numBlocks(static_cast<size_t>(ceil((static_cast<float>(P) / threadsPerBlock.x))),
         static_cast<size_t>(ceil((static_cast<float>(M) / threadsPerBlock.y))));
 
-    mmPerElem<<<numBlocks, threadsPerBlock>>>(A_d, B_d, C_d, M, N, P);
+    naive<<<numBlocks, threadsPerBlock>>>(A_d, B_d, C_d, M, N, P);
 
 
     cudaMemcpy(C, C_d, M * P * sizeof(float), cudaMemcpyDeviceToHost);
