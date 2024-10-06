@@ -27,16 +27,16 @@ int main() {
 
     // Create a library and lookup the kernel function
     MTL::Library* library = device->newLibrary( NS::String::string(kernel, NS::UTF8StringEncoding), nullptr, &pError );
-    MTL::Function* mmPerElem = library->newFunction( NS::String::string("mm_per_elem", NS::UTF8StringEncoding) );
+    MTL::Function* naive = library->newFunction( NS::String::string("naive", NS::UTF8StringEncoding) );
 
     // Check if the function was loaded
-    if(!mmPerElem) {
+    if(!naive) {
         __builtin_printf( "%s", pError->localizedDescription()->utf8String() );
         assert(false);
     }
 
     // Create a pipeline state
-    MTL::ComputePipelineState *_pState = device->newComputePipelineState(mmPerElem, &pError);
+    MTL::ComputePipelineState *_pState = device->newComputePipelineState(naive, &pError);
     // Create a command queue
     MTL::CommandQueue *cmdQueue = device->newCommandQueue();
 
@@ -87,9 +87,26 @@ int main() {
     cmdBuffer->commit();
     cmdBuffer->waitUntilCompleted();
 
-    float* C = static_cast<float*>(C_d->contents());
+    float* result = (float*)malloc(M * P * sizeof(float));
+    memcpy(result, static_cast<float*>(C_d->contents()), M * P * sizeof(float));
 
-    mmPerElem->release();
+    naive->release();
+
+    // MTL::Buffer *A = device->newBuffer(M * N * sizeof(float), MTL::ResourceStorageModeShared);
+    // MTL::Buffer *B = device->newBuffer(N * P * sizeof(float), MTL::ResourceStorageModeShared);
+    // MTL::Buffer *C_d = device->newBuffer(M * P * sizeof(float), MTL::ResourceStorageModeShared);
+    // MTL::Buffer *M_ = device->newBuffer(&M, sizeof(size_t), MTL::ResourceStorageModePrivate);
+    // MTL::Buffer *N_ = device->newBuffer(&N, sizeof(size_t), MTL::ResourceStorageModePrivate);
+    // MTL::Buffer *P_ = device->newBuffer(&P, sizeof(size_t), MTL::ResourceStorageModePrivate);
+
+    // MTL::Function* coalesced = library->newFunction( NS::String::string("coalesced", NS::UTF8StringEncoding) );
+
+    // // Check if the function was loaded
+    // if(!naive) {
+    //     __builtin_printf( "%s", pError->localizedDescription()->utf8String() );
+    //     assert(false);
+    // }
+
     library->release();
     device->release();
 

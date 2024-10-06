@@ -1,7 +1,7 @@
 R"(#include <metal_stdlib>
 using namespace metal;
 
-kernel void mm_per_elem(
+kernel void naive(
     device const float *A,
     device const float *B,
     device float *C,
