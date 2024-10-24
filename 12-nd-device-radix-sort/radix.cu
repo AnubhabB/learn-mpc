@@ -100,6 +100,12 @@ __global__ void RadixUpsweep(
     uint32_t size,
     uint32_t radixShift
 ) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("Debug Info:\n");
+        printf("Grid Size: %d, Block Size: %d\n", gridDim.x, blockDim.x);
+        printf("Input Size: %u, RadixShift: %u\n", size, radixShift);
+        printf("RADIX: %d, VEC_PART_SIZE: %d\n", RADIX, VEC_PART_SIZE);
+    }
     __shared__ uint32_t s_globalHist[RADIX * 2];
 
     //clear shared memory
@@ -115,9 +121,20 @@ __global__ void RadixUpsweep(
         if (blockIdx.x < gridDim.x - 1)
         {
             const uint32_t partEnd = (blockIdx.x + 1) * VEC_PART_SIZE;
+            
             for (uint32_t i = threadIdx.x + (blockIdx.x * VEC_PART_SIZE); i < partEnd; i += blockDim.x)
             {
                 const uint4 t = reinterpret_cast<uint4*>(sort)[i];
+                // if (threadIdx.x == 0 && blockIdx.x == 0 && i == 0) {
+                //     printf("First 4 elements:\n");
+                //     printf("[%u %u %u %u]\n", t.x, t.y, t.z, t.w);
+                //     printf("After shift & mask:\n");
+                //     printf("[%u %u %u %u]\n", 
+                //         t.x >> radixShift & RADIX_MASK,
+                //         t.y >> radixShift & RADIX_MASK,
+                //         t.z >> radixShift & RADIX_MASK,
+                //         t.w >> radixShift & RADIX_MASK);
+                // }
                 atomicAdd(&s_wavesHist[t.x >> radixShift & RADIX_MASK], 1);
                 atomicAdd(&s_wavesHist[t.y >> radixShift & RADIX_MASK], 1);
                 atomicAdd(&s_wavesHist[t.z >> radixShift & RADIX_MASK], 1);
@@ -413,17 +430,17 @@ static inline uint32_t divRoundUp(uint32_t x, uint32_t y) {
     return (x + y - 1) / y;
 }
 
-
-int main() {
+void radix() {
     srand(time(NULL));
 
-    const uint32_t k_radix = 256;
-    const uint32_t k_radixPasses = 4;
-    const uint32_t k_partitionSize = 7680;
+    const uint32_t k_maxSize = PART_SIZE;
+    const uint32_t k_radix = RADIX;
+    const uint32_t k_radixPasses = sizeof(uint32_t);
+    const uint32_t k_partitionSize = PART_SIZE;
     const uint32_t k_upsweepThreads = 128;
     const uint32_t k_scanThreads = 128;
     const uint32_t k_downsweepThreads = 512;
-    const uint32_t k_valPartSize = 4096;
+    const uint32_t k_valPartSize = BIN_HISTS_SIZE;
 
     uint32_t* m_sort;
     uint32_t* m_sortPayload;
@@ -431,34 +448,24 @@ int main() {
     uint32_t* m_altPayload;
     uint32_t* m_globalHistogram;
     uint32_t* m_passHistogram;
+
+    const uint32_t threadblocks = divRoundUp(k_maxSize, k_partitionSize);
+
+    // Allocate memories
+    cudaMalloc(&m_sort, k_maxSize * sizeof(uint32_t)); // Input array
+    cudaMalloc(&m_alt, k_maxSize * sizeof(uint32_t)); // alternate buffer for sorted output
+    cudaMalloc(&m_sortPayload, k_maxSize * sizeof(uint32_t)); // the sort payload
+    cudaMalloc(&m_altPayload, k_maxSize * sizeof(uint32_t)); // alternate buffer for sorted payload
+    cudaMalloc(&m_globalHistogram, k_radix * k_radixPasses * sizeof(uint32_t)); // Global histogram
+    cudaMalloc(&m_passHistogram, threadblocks * k_radix * sizeof(uint32_t)); // Local histogram - scanned offset from current pass?
     
-
-    uint32_t size = 7680;
-    {
-        const uint32_t threadblocks = divRoundUp(size, PART_SIZE);
-
-        // uint32_t* m_errCount;
-
-        uint32_t k_radixPass = 4;
-
-        cudaMalloc(&m_sort, size * sizeof(uint32_t));
-        cudaMalloc(&m_alt, size * sizeof(uint32_t));
-        cudaMalloc(&m_globalHistogram, RADIX * k_radixPass * sizeof(uint32_t));
-        cudaMalloc(&m_passHistogram, threadblocks * RADIX * sizeof(uint32_t));
-
-        cudaMalloc(&m_sortPayload, size * sizeof(uint32_t));
-        cudaMalloc(&m_altPayload, size * sizeof(uint32_t));
-    }
-    
-    
-
     // Create some data
     {
-        uint32_t *msort_H = (uint32_t*)malloc(size * sizeof(uint32_t));
-        uint32_t *mayload_H = (uint32_t*)malloc(size * sizeof(uint32_t));
-        for(int i = 0; i < size; i++) {
-            msort_H[i] = static_cast<uint32_t>(randnum(0, size));
-            mayload_H[size - (i + 1)] = static_cast<uint32_t>(size - (i + 1));
+        uint32_t *msort_H = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
+        uint32_t *mayload_H = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
+        for(int i = 0; i < k_maxSize; i++) {
+            msort_H[i] = static_cast<uint32_t>(randnum(0, k_maxSize));
+            mayload_H[i] = static_cast<uint32_t>(i);
         }
 
         printf("\nBEFORE[200] .........................\n");
@@ -467,66 +474,63 @@ int main() {
         }
         printf("\n.....................................\n");
 
-        cudaMemcpy(&m_sort, &msort_H, size * sizeof(uint32_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(&m_sortPayload, &mayload_H, size * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(&m_sort, &msort_H, k_maxSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(&m_sortPayload, &mayload_H, k_maxSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
         free(msort_H);
         free(mayload_H);
     }
 
-    cudaMemset(m_globalHistogram, 0, RADIX * k_radixPasses * sizeof(uint32_t));
+    cudaMemset(m_globalHistogram, 0, k_radix * k_radixPasses * sizeof(uint32_t));
+    cudaDeviceSynchronize();
+
+    printf("\nNum Passes: %u ThreadBlocks: %u\n", k_radixPasses, threadblocks);
+    for(uint32_t shift=0; shift < k_radixPasses; shift++) {
+        uint32_t pass = shift * 8;
+        printf("Pass: %u[%u]\n", shift, pass);
+        RadixUpsweep <<<threadblocks, k_upsweepThreads>>> (m_sort, m_globalHistogram, m_passHistogram, k_maxSize, pass);
+        RadixScan <<<k_radix, k_scanThreads>>> (m_passHistogram, threadblocks);
+        RadixDownsweepPairs <<<threadblocks, k_downsweepThreads>>>(m_sort, m_sortPayload, m_alt, m_altPayload,
+            m_globalHistogram, m_passHistogram, k_maxSize, pass);
+    }
 
     cudaDeviceSynchronize();
 
-    
-    // for (uint32_t i = k_partitionSize; i < k_partitionSize * 2 + 1; ++i)
-    //     {
-    //         InitRandom <<<256, 256 >>> (
-    //             m_sort,
-    //             m_sortPayload,
-    //             ENTROPY_PRESET_1,
-    //             i,
-    //             i);
-    //         DispatchKernelsPairs(i);
-    //         if (DispatchValidatePairs(i))
-    //             testsPassed++;
-    //         else
-    //             printf("\n Test failed at size %u \n", i);
+    uint32_t *m_sort_h = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
+    uint32_t *m_payl_h = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
 
-    //         if (!(i & 255))
-    //             printf(".");
-    //     }
+    uint32_t *m_sort_h_alt = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
+    uint32_t *m_payl_h_alt = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
 
-    const uint32_t threadblocks = divRoundUp(size, PART_SIZE);
+    cudaMemcpy(&m_sort_h, &m_sort, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&m_payl_h, &m_sortPayload, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
-
-    RadixUpsweep <<<threadblocks, k_upsweepThreads>>> (m_sort, m_globalHistogram, m_passHistogram, size, 0);
-    RadixScan <<<k_radix, k_scanThreads>>> (m_passHistogram, threadblocks);
-    RadixDownsweepPairs <<<threadblocks, k_downsweepThreads>>>(m_sort, m_sortPayload, m_alt, m_altPayload,
-        m_globalHistogram, m_passHistogram, size, 0);
-
-    cudaDeviceSynchronize();
-    
-    uint32_t *vals = (uint32_t*)malloc(size * sizeof(uint32_t));
-    uint32_t *idxs = (uint32_t*)malloc(size * sizeof(uint32_t));
-
-    cudaMemcpy(&vals, &m_sort, size * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&idxs, &m_sortPayload, size * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&m_sort_h_alt, &m_alt, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&m_payl_h_alt, &m_altPayload, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
     printf("\nAFTER[200] .........................\n");
     for(int i=0; i < 200; i++) {
-        printf("[%u %u] ", vals[i], idxs[i]);
+        printf("[%u %u | %u %u] ", m_sort_h[i], m_payl_h[i], m_sort_h_alt[i], m_payl_h_alt[i]);
     }
     printf("\n.....................................\n");
 
-    // Cleanup
-    cudaFree(&m_sort);
-    cudaFree(&m_sortPayload);
-    cudaFree(&m_alt);
-    cudaFree(&m_altPayload);
-    cudaFree(&m_globalHistogram);
-    cudaFree(&m_passHistogram);
 
-    free(vals);
-    free(idxs);
+    // Free memories
+    cudaFree(m_sort);
+    cudaFree(m_alt);
+    cudaFree(m_sortPayload);
+    cudaFree(m_altPayload);
+    cudaFree(m_globalHistogram);
+    cudaFree(m_passHistogram);
+
+    free(m_sort_h);
+    free(m_payl_h);
+
+    free(m_sort_h_alt);
+    free(m_payl_h_alt);
+}
+
+int main() {
+    radix();
+    return 0;
 }
