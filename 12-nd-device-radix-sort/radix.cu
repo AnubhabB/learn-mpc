@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
 #define randnum(min, max) \
         ((rand() % (int)(((max) + 1) - (min))) + (min))
 
@@ -93,19 +96,72 @@ __device__ __forceinline__ uint32_t ActiveInclusiveWarpScan(uint32_t val)
     return val;
 }
 
+// Helper functions for bit conversions
+template<typename T>
+__device__ inline uint32_t toBits(T val, uint32_t radixShift = 0) {
+    if constexpr (std::is_same<T, float>::value) {
+        uint32_t bits;
+        memcpy(&bits, &val, sizeof(float));
+        uint32_t mask = -int(bits >> 31) | 0x80000000;
+        return bits ^ mask;
+    }
+    else if constexpr (std::is_same<T, __half>::value) {
+        uint16_t bits;
+        memcpy(&bits, &val, sizeof(__half));
+        uint16_t mask = -int(bits >> 15) | 0x8000;
+        return static_cast<uint32_t>(bits ^ mask);
+    }
+    else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        uint16_t bits;
+        memcpy(&bits, &val, sizeof(__nv_bfloat16));
+        uint16_t mask = -int(bits >> 15) | 0x8000;
+        return static_cast<uint32_t>(bits ^ mask);
+    }
+    else if constexpr (std::is_same<T, int64_t>::value) {
+        // For 64-bit values, we need to handle the radixShift differently
+        return static_cast<uint32_t>((val >> radixShift) & 0xFFFFFFFF);
+    }
+    else {
+        // For integral types, just cast
+        return static_cast<uint32_t>(val);
+    }
+}
+
+// Helper function to get type-specific maximum value
+template<typename T>
+__device__ inline T getTypeMax() {
+    if constexpr (std::is_same<T, float>::value) {
+        return INFINITY;
+    }
+    else if constexpr (std::is_same<T, __half>::value) {
+        return __float2half(INFINITY);
+    }
+    else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        return __float2bfloat16(INFINITY);
+    }
+    else if constexpr (std::is_same<T, int64_t>::value) {
+        return 0x7FFFFFFFFFFFFFFF;
+    } else if constexpr (std::is_same<T, unsigned char>::value) {
+        return 0xFF; // 255 in hex
+    } else if constexpr (std::is_same<T, u_int32_t>::value) {
+        return 0xFFFFFFFF;  // 4294967295 in hex
+    } else {
+        // This seems to be experimental
+        // calling a constexpr __host__ function("max") from a __device__ function("getTypeMax") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+        
+        // Shouldn't reach here
+        return static_cast<T>(-1);
+    }
+}
+
+template<typename T>
 __global__ void RadixUpsweep(
-    uint32_t* sort,
+    T* sort,
     uint32_t* globalHist,
     uint32_t* passHist,
     uint32_t size,
     uint32_t radixShift
 ) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("Debug Info:\n");
-        printf("Grid Size: %d, Block Size: %d\n", gridDim.x, blockDim.x);
-        printf("Input Size: %u, RadixShift: %u\n", size, radixShift);
-        printf("RADIX: %d, VEC_PART_SIZE: %d\n", RADIX, VEC_PART_SIZE);
-    }
     __shared__ uint32_t s_globalHist[RADIX * 2];
 
     //clear shared memory
@@ -122,23 +178,30 @@ __global__ void RadixUpsweep(
         {
             const uint32_t partEnd = (blockIdx.x + 1) * VEC_PART_SIZE;
             
-            for (uint32_t i = threadIdx.x + (blockIdx.x * VEC_PART_SIZE); i < partEnd; i += blockDim.x)
-            {
-                const uint4 t = reinterpret_cast<uint4*>(sort)[i];
-                // if (threadIdx.x == 0 && blockIdx.x == 0 && i == 0) {
-                //     printf("First 4 elements:\n");
-                //     printf("[%u %u %u %u]\n", t.x, t.y, t.z, t.w);
-                //     printf("After shift & mask:\n");
-                //     printf("[%u %u %u %u]\n", 
-                //         t.x >> radixShift & RADIX_MASK,
-                //         t.y >> radixShift & RADIX_MASK,
-                //         t.z >> radixShift & RADIX_MASK,
-                //         t.w >> radixShift & RADIX_MASK);
-                // }
-                atomicAdd(&s_wavesHist[t.x >> radixShift & RADIX_MASK], 1);
-                atomicAdd(&s_wavesHist[t.y >> radixShift & RADIX_MASK], 1);
-                atomicAdd(&s_wavesHist[t.z >> radixShift & RADIX_MASK], 1);
-                atomicAdd(&s_wavesHist[t.w >> radixShift & RADIX_MASK], 1);
+            // Vector load based on types
+            constexpr uint32_t typesize = sizeof(T);
+
+            // For uint32_t, float (maybe int32??)
+            if(typesize == 4) {
+                using VecT = typename std::conditional<std::is_same<T, float>::value, 
+                                                         float4, uint4>::type;
+
+                for (uint32_t i = threadIdx.x + (blockIdx.x * VEC_PART_SIZE); i < partEnd; i += blockDim.x) {
+                    const VecT t = reinterpret_cast<VecT*>(sort)[i];
+                    // Convert to sortable bits based on type
+                    uint32_t x = toBits(t.x);
+                    uint32_t y = toBits(t.y);
+                    uint32_t z = toBits(t.z);
+                    uint32_t w = toBits(t.w);
+
+                    if(i < 5) {
+                        printf("First block: [%u %u %u %u]\n", x, y, z, w);
+                    }
+                    atomicAdd(&s_wavesHist[x >> radixShift & RADIX_MASK], 1);
+                    atomicAdd(&s_wavesHist[y >> radixShift & RADIX_MASK], 1);
+                    atomicAdd(&s_wavesHist[z >> radixShift & RADIX_MASK], 1);
+                    atomicAdd(&s_wavesHist[w >> radixShift & RADIX_MASK], 1);
+                }
             }
         }
 
@@ -146,8 +209,12 @@ __global__ void RadixUpsweep(
         {
             for (uint32_t i = threadIdx.x + (blockIdx.x * PART_SIZE); i < size; i += blockDim.x)
             {
-                const uint32_t t = sort[i];
-                atomicAdd(&s_wavesHist[t >> radixShift & RADIX_MASK], 1);
+                const T t = sort[i];
+                uint32_t bits = toBits(t, radixShift);
+                if(i < 5) {
+                    printf("Second block: [%u %u]\n", i, bits);
+                }
+                atomicAdd(&s_wavesHist[bits >> radixShift & RADIX_MASK], 1);
             }
         }
     }
@@ -170,6 +237,74 @@ __global__ void RadixUpsweep(
     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
         atomicAdd(&globalHist[i + (radixShift << 5)], s_globalHist[i] + (getLaneId() ? __shfl_sync(0xfffffffe, s_globalHist[i - 1], 1) : 0));
 }
+
+// __global__ void RadixUpsweep(
+//     uint32_t* sort,
+//     uint32_t* globalHist,
+//     uint32_t* passHist,
+//     uint32_t size,
+//     uint32_t radixShift
+// ) {
+//     __shared__ uint32_t s_globalHist[RADIX * 2];
+
+//     //clear shared memory
+//     for (uint32_t i = threadIdx.x; i < RADIX * 2; i += blockDim.x)
+//         s_globalHist[i] = 0;
+//     __syncthreads();
+    
+//     //histogram
+//     {
+//         //64 threads : 1 histogram in shared memory
+//         uint32_t* s_wavesHist = &s_globalHist[threadIdx.x / 64 * RADIX];
+
+//         if (blockIdx.x < gridDim.x - 1)
+//         {
+//             const uint32_t partEnd = (blockIdx.x + 1) * VEC_PART_SIZE;
+            
+//             for (uint32_t i = threadIdx.x + (blockIdx.x * VEC_PART_SIZE); i < partEnd; i += blockDim.x)
+//             {
+//                 const uint4 t = reinterpret_cast<uint4*>(sort)[i];
+//                 if(i < 5) {
+//                     printf("First block: [%u %u %u %u]\n", t.x, t.y, t.z, t.w);
+//                 }
+//                 atomicAdd(&s_wavesHist[t.x >> radixShift & RADIX_MASK], 1);
+//                 atomicAdd(&s_wavesHist[t.y >> radixShift & RADIX_MASK], 1);
+//                 atomicAdd(&s_wavesHist[t.z >> radixShift & RADIX_MASK], 1);
+//                 atomicAdd(&s_wavesHist[t.w >> radixShift & RADIX_MASK], 1);
+//             }
+//         }
+
+//         if (blockIdx.x == gridDim.x - 1)
+//         {
+//             for (uint32_t i = threadIdx.x + (blockIdx.x * PART_SIZE); i < size; i += blockDim.x)
+//             {
+//                 const uint32_t t = sort[i];
+//                 if(i < 5) {
+//                     printf("Second block: [%u %u]\n", i, t);
+//                 }
+//                 atomicAdd(&s_wavesHist[t >> radixShift & RADIX_MASK], 1);
+//             }
+//         }
+//     }
+//     __syncthreads();
+
+//     //reduce to the first hist, pass out, begin prefix sum
+//     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+//     {
+//         s_globalHist[i] += s_globalHist[i + RADIX];
+//         passHist[i * gridDim.x + blockIdx.x] = s_globalHist[i];
+//         s_globalHist[i] = InclusiveWarpScanCircularShift(s_globalHist[i]);
+//     }	
+//     __syncthreads();
+
+//     if (threadIdx.x < (RADIX >> LANE_LOG))
+//         s_globalHist[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHist[threadIdx.x << LANE_LOG]);
+//     __syncthreads();
+    
+//     //Atomically add to device memory
+//     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x)
+//         atomicAdd(&globalHist[i + (radixShift << 5)], s_globalHist[i] + (getLaneId() ? __shfl_sync(0xfffffffe, s_globalHist[i - 1], 1) : 0));
+// }
 
 
 __global__ void RadixScan(
@@ -229,10 +364,11 @@ __global__ void RadixScan(
     }
 }
 
+template<typename T>
 __global__ void RadixDownsweepPairs(
-    uint32_t* sort,
+    T* sort,
     uint32_t* sortPayload,
-    uint32_t* alt, 
+    T* alt, 
     uint32_t* altPayload,
     uint32_t* globalHist,
     uint32_t* passHist,
@@ -248,7 +384,7 @@ __global__ void RadixDownsweepPairs(
         s_warpHistograms[i] = 0;
 
     //load keys
-    uint32_t keys[BIN_KEYS_PER_THREAD];
+    T keys[BIN_KEYS_PER_THREAD];
     if (blockIdx.x < gridDim.x - 1)
     {
         #pragma unroll
@@ -261,11 +397,12 @@ __global__ void RadixDownsweepPairs(
     //Because of the stability of the sort, these keys are guaranteed to be 
     //last when scattered. This allows for effortless divergence free sorting
     //of the final partition.
+    // We'll also incorporate type specific maximum value
     if (blockIdx.x == gridDim.x - 1)
     {
         #pragma unroll
         for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
-            keys[i] = t < size ? sort[t] : 0xffffffff;
+            keys[i] = t < size ? sort[t] : getTypeMax<T>();
     }
     __syncthreads();
 
@@ -276,15 +413,16 @@ __global__ void RadixDownsweepPairs(
     {
         unsigned warpFlags = 0xffffffff;
         #pragma unroll
-        for (int k = 0; k < RADIX_LOG; ++k)
-        {
-            const bool t2 = keys[i] >> k + radixShift & 1;
+        for (int k = 0; k < RADIX_LOG; ++k) {
+            // Convert to sortable bits before extracting radix
+            uint32_t bits = toBits(keys[i], radixShift);
+            const bool t2 = bits >> k + radixShift & 1;
             warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
         }
         const uint32_t bits = __popc(warpFlags & getLaneMaskLt());
         uint32_t preIncrementVal;
         if (bits == 0)
-            preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[keys[i] >> radixShift & RADIX_MASK], __popc(warpFlags));
+            preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[toBits(keys[i]) >> radixShift & RADIX_MASK], __popc(warpFlags));
 
         offsets[i] = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
     }
@@ -319,7 +457,7 @@ __global__ void RadixDownsweepPairs(
         #pragma unroll 
         for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
         {
-            const uint32_t t2 = keys[i] >> radixShift & RADIX_MASK;
+            const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
             offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
         }
     }
@@ -327,7 +465,7 @@ __global__ void RadixDownsweepPairs(
     {
         #pragma unroll
         for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-            offsets[i] += s_warpHistograms[keys[i] >> radixShift & RADIX_MASK];
+            offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
     }
 
     //load in threadblock reductions
@@ -353,7 +491,8 @@ __global__ void RadixDownsweepPairs(
         for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
             ++i, t += blockDim.x)
         {
-            digits[i] = s_warpHistograms[t] >> radixShift & RADIX_MASK;
+            uint32_t sortableBits = toBits(s_warpHistograms[t], radixShift);
+            digits[i] = sortableBits >> radixShift & RADIX_MASK;
             alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
         }
         __syncthreads();
@@ -382,6 +521,7 @@ __global__ void RadixDownsweepPairs(
         }
     }
 
+    // scatter with size check
     if (blockIdx.x == gridDim.x - 1)
     {
         const uint32_t finalPartSize = size - BIN_PART_START;
@@ -392,7 +532,8 @@ __global__ void RadixDownsweepPairs(
         {
             if (t < finalPartSize)
             {
-                digits[i] = s_warpHistograms[t] >> radixShift & RADIX_MASK;
+                uint32_t sortableBits = toBits(s_warpHistograms[t], radixShift);
+                digits[i] = sortableBits >> radixShift & RADIX_MASK;
                 alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
             }
         }
@@ -430,92 +571,108 @@ static inline uint32_t divRoundUp(uint32_t x, uint32_t y) {
     return (x + y - 1) / y;
 }
 
+
+template <typename T>
 void radix() {
     srand(time(NULL));
 
-    const uint32_t k_maxSize = PART_SIZE;
+    const uint32_t k_maxSize = 7680;
     const uint32_t k_radix = RADIX;
     const uint32_t k_radixPasses = sizeof(uint32_t);
     const uint32_t k_partitionSize = PART_SIZE;
     const uint32_t k_upsweepThreads = 128;
     const uint32_t k_scanThreads = 128;
     const uint32_t k_downsweepThreads = 512;
-    const uint32_t k_valPartSize = BIN_HISTS_SIZE;
 
-    uint32_t* m_sort;
+    T* m_sort;
     uint32_t* m_sortPayload;
-    uint32_t* m_alt;
+    T* m_alt;
     uint32_t* m_altPayload;
     uint32_t* m_globalHistogram;
     uint32_t* m_passHistogram;
 
     const uint32_t threadblocks = divRoundUp(k_maxSize, k_partitionSize);
 
+    uint32_t sortsize = k_maxSize * sizeof(T);
+    uint32_t payloadsize = k_maxSize * sizeof(uint32_t);
+
     // Allocate memories
-    cudaMalloc(&m_sort, k_maxSize * sizeof(uint32_t)); // Input array
-    cudaMalloc(&m_alt, k_maxSize * sizeof(uint32_t)); // alternate buffer for sorted output
-    cudaMalloc(&m_sortPayload, k_maxSize * sizeof(uint32_t)); // the sort payload
-    cudaMalloc(&m_altPayload, k_maxSize * sizeof(uint32_t)); // alternate buffer for sorted payload
+    cudaMalloc(&m_sort, sortsize); // Input array
+    cudaMalloc(&m_alt, sortsize); // alternate buffer for sorted output
+    cudaMalloc(&m_sortPayload, payloadsize); // the sort payload
+    cudaMalloc(&m_altPayload, payloadsize); // alternate buffer for sorted payload
     cudaMalloc(&m_globalHistogram, k_radix * k_radixPasses * sizeof(uint32_t)); // Global histogram
     cudaMalloc(&m_passHistogram, threadblocks * k_radix * sizeof(uint32_t)); // Local histogram - scanned offset from current pass?
+
     
     // Create some data
-    {
-        uint32_t *msort_H = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
-        uint32_t *mayload_H = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
-        for(int i = 0; i < k_maxSize; i++) {
-            msort_H[i] = static_cast<uint32_t>(randnum(0, k_maxSize));
-            mayload_H[i] = static_cast<uint32_t>(i);
-        }
-
-        printf("\nBEFORE[200] .........................\n");
-        for(int i=0; i < 200; i++) {
-            printf("[%u %u] ", msort_H[i], mayload_H[i]);
-        }
-        printf("\n.....................................\n");
-
-        cudaMemcpy(&m_sort, &msort_H, k_maxSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(&m_sortPayload, &mayload_H, k_maxSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
-
-        free(msort_H);
-        free(mayload_H);
+    T *msort_H = (T*)malloc(sortsize);
+    uint32_t *mayload_H = (uint32_t*)malloc(payloadsize);
+    for(int i = 0; i < k_maxSize; i++) {
+        msort_H[i] = static_cast<T>(randnum(0, k_maxSize));
+        mayload_H[i] = static_cast<uint32_t>(i);
     }
+
+    printf("\nBEFORE[200] .........................\n");
+    for(int i=0; i < 200; i++) {
+        if(std::is_same<T, uint32_t>::value) {
+            printf("[%u ", msort_H[i]);
+        } else if(std::is_same<T, float>::value) {
+            printf("[%f ", msort_H[i]);
+        }
+        printf("%u] ", mayload_H[i]);
+    }
+    printf("\n.....................................\n");
+
+    cudaMemcpy(m_sort, msort_H, sortsize, cudaMemcpyHostToDevice);
+    cudaMemcpy(m_sortPayload, mayload_H, payloadsize, cudaMemcpyHostToDevice);
 
     cudaMemset(m_globalHistogram, 0, k_radix * k_radixPasses * sizeof(uint32_t));
     cudaDeviceSynchronize();
 
-    printf("\nNum Passes: %u ThreadBlocks: %u\n", k_radixPasses, threadblocks);
+
     for(uint32_t shift=0; shift < k_radixPasses; shift++) {
         uint32_t pass = shift * 8;
-        printf("Pass: %u[%u]\n", shift, pass);
-        RadixUpsweep <<<threadblocks, k_upsweepThreads>>> (m_sort, m_globalHistogram, m_passHistogram, k_maxSize, pass);
+        RadixUpsweep<T> <<<threadblocks, k_upsweepThreads>>> (m_sort, m_globalHistogram, m_passHistogram, k_maxSize, pass);
         RadixScan <<<k_radix, k_scanThreads>>> (m_passHistogram, threadblocks);
-        RadixDownsweepPairs <<<threadblocks, k_downsweepThreads>>>(m_sort, m_sortPayload, m_alt, m_altPayload,
+        RadixDownsweepPairs<T> <<<threadblocks, k_downsweepThreads>>> (m_sort, m_sortPayload, m_alt, m_altPayload,
             m_globalHistogram, m_passHistogram, k_maxSize, pass);
+
+        std::swap(m_sort, m_alt);
+        std::swap(m_sortPayload, m_altPayload);
     }
 
     cudaDeviceSynchronize();
 
-    uint32_t *m_sort_h = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
-    uint32_t *m_payl_h = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
+    T *m_sort_h = (T*)malloc(sortsize);
+    uint32_t *m_payl_h = (uint32_t*)malloc(payloadsize);
 
-    uint32_t *m_sort_h_alt = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
-    uint32_t *m_payl_h_alt = (uint32_t*)malloc(k_maxSize * sizeof(uint32_t));
+    cudaMemcpy(m_sort_h, m_sort, sortsize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(m_payl_h, m_sortPayload, payloadsize, cudaMemcpyDeviceToHost);
 
-    cudaMemcpy(&m_sort_h, &m_sort, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&m_payl_h, &m_sortPayload, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
-    cudaMemcpy(&m_sort_h_alt, &m_alt, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&m_payl_h_alt, &m_altPayload, k_maxSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-
+    // Validate
     printf("\nAFTER[200] .........................\n");
-    for(int i=0; i < 200; i++) {
-        printf("[%u %u | %u %u] ", m_sort_h[i], m_payl_h[i], m_sort_h_alt[i], m_payl_h_alt[i]);
+    T last = m_sort_h[0];
+    uint32_t err = 0;
+
+    for(int i=1; i < k_maxSize; ++i) {
+        // if last one is greater than current one, or value at sorted index in original array != current value, its an error
+        if(last <= m_sort_h[i] && msort_H[m_payl_h[i]] == m_sort_h[i]) {
+            last = m_sort_h[i];
+            continue;
+        }
+        err += 1;
+        if(err < 10 && std::is_same<T, float>::value) {
+            printf("Error[%d]: Index[%d] Last[%f] Current[%f] Val@Origin[%f] last.le(cur)[%d]\n", i, m_payl_h[i], last, m_sort_h[i], msort_H[m_payl_h[i]], last <= m_sort_h[i]);
+        }
     }
     printf("\n.....................................\n");
 
 
     // Free memories
+    free(msort_H);
+    free(mayload_H);
+
     cudaFree(m_sort);
     cudaFree(m_alt);
     cudaFree(m_sortPayload);
@@ -526,11 +683,13 @@ void radix() {
     free(m_sort_h);
     free(m_payl_h);
 
-    free(m_sort_h_alt);
-    free(m_payl_h_alt);
+    printf("%u errors", err);
 }
 
 int main() {
-    radix();
+    // Test uint32_t
+    radix<uint32_t>();
+    // Test float
+    radix<float>();
     return 0;
 }
