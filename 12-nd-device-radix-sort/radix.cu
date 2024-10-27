@@ -1,9 +1,44 @@
+#include <stdint.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-#define RADIX               256     //Number of digit bins
+#define RADIX               256             //Number of digit bins
+#define WARP_SIZE           32
+#define LANE_LOG            5               // LANE_LOG = 5 since 2^5 = 32 = warp size
 #define RADIX_MASK          (RADIX - 1)     //Mask of digit bins, to extract digits
-#define RADIX_LOG           8
+#define LANE_MASK           (WARP_SIZE - 1)
+
+__device__ __forceinline__ uint32_t getLaneId() {
+    uint32_t laneId;
+    asm("mov.u32 %0, %%laneid;" : "=r"(laneId));
+    return laneId;
+}
+
+// Circular shift prefix sum
+__device__ __forceinline__ uint32_t InclusiveWarpScanCircularShift(uint32_t val) {
+    // 16 = LANE_COUNT >> 1
+    #pragma unroll
+    for (int i = 1; i <= 16; i <<= 1) {
+        const uint32_t t = __shfl_up_sync(0xffffffff, val, i, 32);
+        if (getLaneId() >= i) val += t;
+    }
+
+    return __shfl_sync(0xffffffff, val, getLaneId() + LANE_MASK & LANE_MASK);
+}
+
+// Prefix sum of active threads ot including itself
+__device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val) {
+    const uint32_t mask = __activemask();
+    // 16 = LANE_COUNT >> 1
+    #pragma unroll
+    for (int i = 1; i <= 16; i <<= 1) {
+        const uint32_t t = __shfl_up_sync(mask, val, i, 32);
+        if (getLaneId() >= i) val += t;
+    }
+
+    const uint32_t t = __shfl_up_sync(mask, val, 1, 32);
+    return getLaneId() ? t : 0;
+}
 
 // Helper functions for bit conversions
 template<typename T>
@@ -44,13 +79,13 @@ struct VectorType<uint32_t> {
     using type = uint4;
 };
 
-template<>
-struct VectorType<half> {
+// template<>
+// struct VectorType<half> {
     // using type = half4
     // alignas(8) struct {
     //     half x, y, z, w;
     // };
-};
+// };
 
 // template<>
 // struct VectorType<nv_bfloat16> {
@@ -77,11 +112,12 @@ __global__ void RadixUpsweep(
     const uint32_t vecPartSize // max number of `vector elements` in block
 ) {
     // Shared memory for histogram - two sections to avoid bank conflicts
-    __shared__ uint32_t s_globalHist[RADIX * 2];
+    constexpr uint32_t sharedSize = RADIX * 2;
+    __shared__ uint32_t s_globalHist[sharedSize];
 
     // Clear shared memory histogram
     #pragma unroll
-    for (uint32_t i = threadIdx.x; i < RADIX * 2; i += blockDim.x)
+    for (uint32_t i = threadIdx.x; i < sharedSize; i += blockDim.x)
         s_globalHist[i] = 0;
     __syncthreads();
 
@@ -97,13 +133,12 @@ __global__ void RadixUpsweep(
 
     // Calculate number of full vectors - we are going to make an attempt to process 4 vectors at a time
     const uint32_t full_vecs = elements_in_block / vec_size;
-    // const uint32_t partials  = elements_in_block % vec_size;
 
     for (uint32_t i = threadIdx.x; i < full_vecs; i += blockDim.x) {
         const uint32_t idx = block_start / vec_size + i;
         const VecT vec_val = reinterpret_cast<const VecT*>(sort)[idx];
         
-        uint32_t values[4] = {
+        uint32_t values[vec_size] = {
             toBits(vec_val.x),
             toBits(vec_val.y),
             toBits(vec_val.z),
@@ -111,7 +146,7 @@ __global__ void RadixUpsweep(
         };
         
         #pragma unroll
-        for (int j = 0; j < 4; j++) {
+        for (int j = 0; j < vec_size; j++) {
             atomicAdd(&s_globalHist[values[j] >> radixShift & RADIX_MASK], 1);
         }
     }
@@ -120,9 +155,32 @@ __global__ void RadixUpsweep(
     const uint32_t vec_end = block_start + (full_vecs * vec_size);
     for (uint32_t i = threadIdx.x + vec_end; i < block_end; i += blockDim.x) {
         const T t = sort[i];
-        uint32_t bits = toBits(t, radixShift);
-        atomicAdd(&s_globalHist[bits & RADIX_MASK], 1);
+        uint32_t bits = toBits(t);
+        atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
     }
 
     __syncthreads();
+
+    // Reduce histograms and prepare for prefix sum
+    for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x) {
+        s_globalHist[i] += s_globalHist[i + RADIX];
+        passHist[i * gridDim.x + blockIdx.x] = s_globalHist[i];
+        s_globalHist[i] = InclusiveWarpScanCircularShift(s_globalHist[i]);
+    }   
+    __syncthreads();
+
+    // Perform warp-level scan
+    if (threadIdx.x < (RADIX >> LANE_LOG))
+        s_globalHist[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHist[threadIdx.x << LANE_LOG]);
+    __syncthreads();
+
+    // Update global histogram with prefix sum results
+    for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x) {
+        atomicAdd(
+            &globalHist[i + (radixShift << LANE_LOG)], 
+            s_globalHist[i] + 
+            (getLaneId() ? 
+                __shfl_sync(0xfffffffe, s_globalHist[i - 1], 1) : 0)
+        );
+    }
 }
