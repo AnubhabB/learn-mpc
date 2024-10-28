@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdint.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -19,9 +20,9 @@ __device__ __forceinline__ uint32_t getLaneId() {
 // Uses butterfly/sequential addressing pattern for efficiency
 __device__ __forceinline__ uint32_t InclusiveWarpScan(uint32_t val) {
     #pragma unroll
-    for (int i = 1; i <= 16; i <<= 1) {
-        const uint32_t t = __shfl_up_sync(0xffffffff, val, i);
-        if (getLaneId() >= i) val += t;
+    for (int offset = 1; offset <= WARP_SIZE; offset <<= 1) {
+        const uint32_t t = __shfl_up_sync(0xffffffff, val, offset);
+        if (getLaneId() >= offset) val += t;
     }
 
     return val;
@@ -29,24 +30,25 @@ __device__ __forceinline__ uint32_t InclusiveWarpScan(uint32_t val) {
 
 // Circular shift prefix sum
 __device__ __forceinline__ uint32_t InclusiveWarpScanCircularShift(uint32_t val) {
-    // 16 = LANE_COUNT >> 1
     #pragma unroll
-    for (int i = 1; i <= 16; i <<= 1) {
-        const uint32_t t = __shfl_up_sync(0xffffffff, val, i, 32);
-        if (getLaneId() >= i) val += t;
+    for (int offset = 1; offset <= WARP_SIZE; offset <<= 1) {
+        const uint32_t t = __shfl_up_sync(0xffffffff, val, offset);
+        if (getLaneId() >= offset) val += t;
     }
 
     return __shfl_sync(0xffffffff, val, getLaneId() + LANE_MASK & LANE_MASK);
 }
 
-// Helper for active warp scan (used for inter-warp scan)
+// Helper for active warp scan (used for inter-warp scan) with early termination
 __device__ __forceinline__ uint32_t ActiveInclusiveWarpScan(uint32_t val) {
     const uint32_t mask = __activemask();
+    const int active_threads = __popc(mask);
+
     #pragma unroll
-    for (int i = 1; i <= 16; i <<= 1)
-    {
-        const uint32_t t = __shfl_up_sync(mask, val, i, 32);
-        if (getLaneId() >= i) val += t;
+    for (int offset = 1; offset <= WARP_SIZE; offset <<= 1) {
+        if (offset >= active_threads) break;  // Early termination
+        const uint32_t t = __shfl_up_sync(mask, val, offset);
+        if (getLaneId() >= offset) val += t;
     }
 
     return val;
@@ -55,14 +57,13 @@ __device__ __forceinline__ uint32_t ActiveInclusiveWarpScan(uint32_t val) {
 // Prefix sum of active threads ot including itself
 __device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val) {
     const uint32_t mask = __activemask();
-    // 16 = LANE_COUNT >> 1
     #pragma unroll
-    for (int i = 1; i <= 16; i <<= 1) {
-        const uint32_t t = __shfl_up_sync(mask, val, i, 32);
-        if (getLaneId() >= i) val += t;
+    for (int offset = 1; offset <= WARP_SIZE; offset <<= 1) {
+        const uint32_t t = __shfl_up_sync(mask, val, offset);
+        if (getLaneId() >= offset) val += t;
     }
 
-    const uint32_t t = __shfl_up_sync(mask, val, 1, 32);
+    const uint32_t t = __shfl_up_sync(mask, val, 1);
     return getLaneId() ? t : 0;
 }
 
@@ -204,147 +205,121 @@ __global__ void RadixUpsweep(
     }
 }
 
+
+
+// TODO: optimize this with shared memory
 __global__ void RadixScan(
     uint32_t* passHist,
     const uint32_t threadBlocks
 ) {
-    // const uint32_t stride = blockDim.x;
-
-    // Dynamically allocated shared memory for scan operations
-    extern __shared__ uint32_t s_scan[];
-
-    // Calculate thread indices and offsets
     const uint32_t lane_id = getLaneId();
-    const uint32_t circular_lane_shift = (lane_id + 1) & LANE_MASK;
     const uint32_t digit_offset = blockIdx.x * threadBlocks;
-
-    // Calculate end of full partitions
-    const uint32_t partitions_end = threadBlocks / blockDim.x * blockDim.x;
-    uint32_t reduction = 0;
-
-    // Process full blocks - matching original implementation
-    for (uint32_t i = threadIdx.x; i < partitions_end; i += blockDim.x) {
-        // Load and perform warp-level scan
-        s_scan[threadIdx.x] = passHist[i + digit_offset];
-        s_scan[threadIdx.x] = InclusiveWarpScan(s_scan[threadIdx.x]);
-        __syncthreads();
-
-        // Inter-warp scan - process last element of each warp
-        if (threadIdx.x < (blockDim.x >> LANE_LOG)) {
-            s_scan[(threadIdx.x + 1 << LANE_LOG) - 1] = 
-                ActiveInclusiveWarpScan(s_scan[(threadIdx.x + 1 << LANE_LOG) - 1]);
+    
+    // Process in chunks of WARP_SIZE
+    const uint32_t num_warps = (threadBlocks + WARP_SIZE - 1) / WARP_SIZE;
+    uint32_t running_sum = 0;
+    
+    // Process each warp-sized chunk
+    for (uint32_t warp = 0; warp < num_warps; warp++) {
+        const uint32_t start_idx = warp * WARP_SIZE;
+        const uint32_t local_idx = start_idx + lane_id;
+        
+        // Load and scan within warp
+        uint32_t val = 0;
+        if (local_idx < threadBlocks) {
+            val = passHist[digit_offset + local_idx];
         }
-        __syncthreads();
-
-        // Write result with circular shift to avoid bank conflicts
-        passHist[circular_lane_shift + (i & ~LANE_MASK) + digit_offset] =
-            (lane_id != LANE_MASK ? s_scan[threadIdx.x] : 0) +
-            (threadIdx.x >= WARP_SIZE ? 
-                __shfl_sync(0xffffffff, s_scan[threadIdx.x - 1], 0) : 0) +
-            reduction;
         
-        // Update reduction for next iteration
-        reduction += s_scan[blockDim.x - 1];
-        __syncthreads();
-    }
-
-    // Handle remaining elements
-    uint32_t i = threadIdx.x + partitions_end;
-    if (i < threadBlocks) {
-        // Same process for remainder
-        s_scan[threadIdx.x] = passHist[i + digit_offset];
-        s_scan[threadIdx.x] = InclusiveWarpScan(s_scan[threadIdx.x]);
-        __syncthreads();
+        // Perform inclusive scan within warp
+        val = InclusiveWarpScan(val);
         
-        if (threadIdx.x < (blockDim.x >> LANE_LOG)) {
-            s_scan[(threadIdx.x + 1 << LANE_LOG) - 1] = 
-                ActiveInclusiveWarpScan(s_scan[(threadIdx.x + 1 << LANE_LOG) - 1]);
+        // Add running sum from previous iterations
+        val += running_sum;
+        
+        // Store result if within bounds
+        if (local_idx < threadBlocks) {
+            passHist[digit_offset + local_idx] = val;
         }
-        __syncthreads();
         
-        const uint32_t write_idx = circular_lane_shift + (i & ~LANE_MASK) + digit_offset;
-        if (write_idx < threadBlocks + digit_offset) {
-            passHist[write_idx] =
-                (lane_id != LANE_MASK ? s_scan[threadIdx.x] : 0) +
-                (threadIdx.x >= WARP_SIZE ? 
-                    __shfl_sync(0xffffffff, s_scan[threadIdx.x - 1], 0) : 0) +
-                reduction;
+        // Update running sum for next iteration
+        // Get the last valid value in this warp
+        uint32_t warp_last = __shfl_sync(0xffffffff, val, min(threadBlocks - start_idx, WARP_SIZE) - 1);
+        if (lane_id == 0) {
+            running_sum = warp_last;
         }
     }
-
-    // // const uint32_t laneId = threadIdx.x & LANE_MASK;        // Thread position within warp
-    // // const uint32_t warpId = threadIdx.x >> LANE_LOG;        // Warp number within block
-    // // const uint32_t digitOffset = blockIdx.x * threadBlocks; // Offset for current radix digit
-
-    // // Initialize variables for processing full blocks
-    // uint32_t reduction = 0; // Running sum from previous iterations
-    // // Calculate end point for full block processing
-    // const uint32_t fullBlocksEnd = (threadBlocks / stride) * stride;
-
-    // // Process full blocks that can use all threads
-    // for(uint32_t i=threadIdx.x; i<fullBlocksEnd; i+=stride) {
-    //     // Load data and perform warp-level scan
-    //     uint32_t val = passHist[i + digitOffset];
-    //     val = InclusiveWarpScan(val, laneId);
-
-    //     s_scan[threadIdx.x] = val;
-    //     __syncthreads();
-
-    //     // Perform inter-warp scan using last thread of each warp
-    //     if (laneId == LANE_MASK) {
-    //         uint32_t warpResult = s_scan[threadIdx.x];
-    //         // Scan across warp results
-    //         warpResult = InclusiveWarpScan(warpResult, warpId);
-    //         s_scan[threadIdx.x] = warpResult;
-    //     }
-    //     __syncthreads();  // Ensure inter-warp scan is complete
-
-    //     // Calculate final value including previous iterations
-    //     uint32_t writeVal = val;
-    //     if (warpId > 0) {
-    //         // Add result from previous warp
-    //         writeVal += s_scan[((warpId - 1) << LANE_LOG) + LANE_MASK];
-    //     }
-    //     writeVal += reduction;  // Add reduction from previous iterations
-
-    //     // Write result with circular shift to avoid bank conflicts
-    //     const uint32_t writeIndex = ((i & ~LANE_MASK) + 
-    //         ((laneId + 1) & LANE_MASK)) + digitOffset;
-    //     passHist[writeIndex] = writeVal;
-
-    //     // Update reduction for next iteration
-    //     reduction += s_scan[stride - 1];
-    //     __syncthreads();  // Ensure shared memory is ready for next iteration
-    // }
-
-    // // Handle remaining elements (partial block)
-    // if (threadIdx.x < (threadBlocks - fullBlocksEnd)) {
-    //     uint32_t i = fullBlocksEnd + threadIdx.x;
-        
-    //     // Perform same scan operation as above but with bounds checking
-    //     uint32_t val = passHist[i + digitOffset];
-    //     val = InclusiveWarpScan(val, laneId);
-    //     s_scan[threadIdx.x] = val;
-    //     __syncthreads();
-        
-    //     if (laneId == LANE_MASK) {
-    //         uint32_t warpResult = s_scan[threadIdx.x];
-    //         warpResult = InclusiveWarpScan(warpResult, warpId);
-    //         s_scan[threadIdx.x] = warpResult;
-    //     }
-    //     __syncthreads();
-        
-    //     uint32_t writeVal = val;
-    //     if (warpId > 0) {
-    //         writeVal += s_scan[((warpId - 1) << LANE_LOG) + LANE_MASK];
-    //     }
-    //     writeVal += reduction;
-        
-    //     // Write result with bounds checking for partial block
-    //     const uint32_t writeIndex = ((i & ~LANE_MASK) + 
-    //         ((laneId + 1) & LANE_MASK)) + digitOffset;
-    //     if (writeIndex < threadBlocks + digitOffset) {
-    //         passHist[writeIndex] = writeVal;
-    //     }
-    // }
 }
+
+// __device__ __forceinline__ uint32_t warpInclusiveScan(uint32_t val) {
+//     #pragma unroll
+//     for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+//         uint32_t temp = __shfl_up_sync(0xffffffff, val, offset);
+//         if (getLaneId() >= offset) {
+//             val += temp;
+//         }
+//     }
+//     return val;
+// }
+
+// __global__ void RadixScan(
+//     uint32_t* passHist,
+//     const uint32_t threadBlocks
+// ) {
+//     extern __shared__ uint32_t s_scan[];
+    
+//     const uint32_t lane_id = getLaneId();
+//     const uint32_t digit_offset = blockIdx.x * threadBlocks;
+
+//     // Special case for small thread blocks
+//     if (threadBlocks <= WARP_SIZE) {
+//         if (lane_id < threadBlocks) {
+//             uint32_t val = passHist[digit_offset + lane_id];
+            
+//             // Perform scan within the first warp
+//             val = warpInclusiveScan(val);
+            
+//             // Write back
+//             passHist[digit_offset + lane_id] = val;
+//         }
+//         return;
+//     }
+    
+//     // Regular case for larger thread blocks
+//     const uint32_t warp_id = threadIdx.x >> LANE_LOG;
+    
+//     // Step 1: Load data into shared memory
+//     uint32_t val = 0;
+//     if (threadIdx.x < threadBlocks) {
+//         val = passHist[digit_offset + threadIdx.x];
+//     }
+//     s_scan[threadIdx.x] = val;
+//     __syncthreads();
+    
+//     // Step 2: Perform intra-warp scan
+//     val = warpInclusiveScan(val);
+//     s_scan[threadIdx.x] = val;
+//     __syncthreads();
+    
+//     // Step 3: Collect last elements from each warp
+//     if (lane_id == WARP_SIZE-1 && warp_id < (threadBlocks + WARP_SIZE - 1) / WARP_SIZE) {
+//         uint32_t warp_result = s_scan[threadIdx.x];
+//         s_scan[blockDim.x + warp_id] = warp_result;
+//     }
+//     __syncthreads();
+    
+//     // Step 4: Scan warp results using first warp
+//     if (warp_id == 0 && lane_id < (threadBlocks + WARP_SIZE - 1) / WARP_SIZE) {
+//         uint32_t warp_sum = s_scan[blockDim.x + lane_id];
+//         warp_sum = warpInclusiveScan(warp_sum);
+//         s_scan[blockDim.x + lane_id] = warp_sum;
+//     }
+//     __syncthreads();
+    
+//     // Step 5: Add warp scan results back
+//     if (threadIdx.x < threadBlocks) {
+//         if (warp_id > 0) {
+//             val += s_scan[blockDim.x + warp_id - 1];
+//         }
+//         passHist[digit_offset + threadIdx.x] = val;
+//     }
+// }

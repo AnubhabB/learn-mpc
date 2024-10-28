@@ -10,7 +10,7 @@
         ((rand() % (int)(((max) + 1) - (min))) + (min))
 
 #define RADIX               256     //Number of digit bins
-#define RADIX_MASK          (RADIX - 1)     //Mask of digit bins, to extract digits
+#define RADIX_MASK          255     //Mask of digit bins, to extract digits
 #define RADIX_LOG           8
 
 #define LANE_COUNT          32
@@ -20,13 +20,13 @@
 
 //For the upfront global histogram kernel
 #define PART_SIZE			7680
-#define VEC_PART_SIZE		(PART_SIZE / 4)
+#define VEC_PART_SIZE		1920
 
 //For the digit binning
-// #define BIN_PART_SIZE       PART_SIZE                               //Partition tile size in k_DigitBinning
+#define BIN_PART_SIZE       7680                                    //Partition tile size in k_DigitBinning
 #define BIN_HISTS_SIZE      4096                                    //Total size of warp histograms in shared memory in k_DigitBinning
-// #define BIN_SUB_PART_SIZE   480                                     //Subpartition tile size of a single warp in k_DigitBinning
-#define BIN_KEYS_PER_THREAD 8                                       //Keys per thread in k_DigitBinning
+#define BIN_SUB_PART_SIZE   480                                     //Subpartition tile size of a single warp in k_DigitBinning
+#define BIN_KEYS_PER_THREAD 15                                      //Keys per thread in k_DigitBinning
 #define BIN_SUB_PART_START  (WARP_INDEX * BIN_SUB_PART_SIZE)        //Starting offset of a subpartition tile
 #define BIN_PART_START      (blockIdx.x * BIN_PART_SIZE)			//Starting offset of a partition tile
 
@@ -44,10 +44,11 @@ __device__ __forceinline__ unsigned getLaneMaskLt()
     return mask;
 }
 
-__device__ __forceinline__ uint32_t InclusiveWarpScanCircularShift(uint32_t val) {
-    // 16 = LANE_COUNT >> 1
+__device__ __forceinline__ uint32_t InclusiveWarpScanCircularShift(uint32_t val)
+{
     #pragma unroll
-    for (int i = 1; i <= 16; i <<= 1) {
+    for (int i = 1; i <= 16; i <<= 1) // 16 = LANE_COUNT >> 1
+    {
         const uint32_t t = __shfl_up_sync(0xffffffff, val, i, 32);
         if (getLaneId() >= i) val += t;
     }
@@ -99,47 +100,30 @@ __device__ __forceinline__ uint32_t ActiveInclusiveWarpScan(uint32_t val)
 template<typename T>
 __device__ inline uint32_t toBits(T val, uint32_t radixShift = 0) {
     if constexpr (std::is_same<T, float>::value) {
-        return __float_as_uint(val) ^ ((__float_as_uint(val) >> 31) | 0x80000000);
+        uint32_t bits;
+        memcpy(&bits, &val, sizeof(float));
+        uint32_t mask = -int(bits >> 31) | 0x80000000;
+        return bits ^ mask;
     }
     else if constexpr (std::is_same<T, __half>::value) {
-        uint16_t bits = __half_as_ushort(val);
+        uint16_t bits;
+        memcpy(&bits, &val, sizeof(__half));
         uint16_t mask = -int(bits >> 15) | 0x8000;
         return static_cast<uint32_t>(bits ^ mask);
     }
     else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-        uint16_t bits = __bfloat16_as_ushort(val);
+        uint16_t bits;
+        memcpy(&bits, &val, sizeof(__nv_bfloat16));
         uint16_t mask = -int(bits >> 15) | 0x8000;
         return static_cast<uint32_t>(bits ^ mask);
     }
     else if constexpr (std::is_same<T, int64_t>::value) {
+        // For 64-bit values, we need to handle the radixShift differently
         return static_cast<uint32_t>((val >> radixShift) & 0xFFFFFFFF);
     }
     else {
+        // For integral types, just cast
         return static_cast<uint32_t>(val);
-    }
-}
-
-template<typename T>
-__device__ inline T fromBits(uint32_t bits, uint32_t radixShift = 0) {
-    if constexpr (std::is_same<T, float>::value) {
-        uint32_t mask = ((bits >> 31) - 1) | 0x80000000;
-        return __uint_as_float(bits ^ mask);
-    }
-    else if constexpr (std::is_same<T, __half>::value) {
-        uint16_t shortBits = static_cast<uint16_t>(bits);
-        uint16_t mask = ((shortBits >> 15) - 1) | 0x8000;
-        return __ushort_as_half(shortBits ^ mask);
-    }
-    else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-        uint16_t shortBits = static_cast<uint16_t>(bits);
-        uint16_t mask = ((shortBits >> 15) - 1) | 0x8000;
-        return __ushort_as_bfloat16(shortBits ^ mask);
-    }
-    else if constexpr (std::is_same<T, int64_t>::value) {
-        return static_cast<int64_t>(bits) << radixShift;
-    }
-    else {
-        return static_cast<T>(bits);
     }
 }
 
@@ -170,7 +154,7 @@ __device__ inline T getTypeMax() {
     }
 }
 
-template <typename T>
+template<typename T>
 __global__ void RadixUpsweep(
     T* sort,
     uint32_t* globalHist,
@@ -187,7 +171,9 @@ __global__ void RadixUpsweep(
     
     //histogram
     {
-    // 64 threads : 1 histogram in shared memory
+        //64 threads : 1 histogram in shared memory
+        uint32_t* s_wavesHist = &s_globalHist[threadIdx.x / 64 * RADIX];
+
         if (blockIdx.x < gridDim.x - 1)
         {
             const uint32_t partEnd = (blockIdx.x + 1) * VEC_PART_SIZE;
@@ -197,7 +183,8 @@ __global__ void RadixUpsweep(
 
             // For uint32_t, float (maybe int32??)
             if(typesize == 4) {
-                using VecT = typename std::conditional<std::is_same<T, float>::value, float4, uint4>::type;
+                using VecT = typename std::conditional<std::is_same<T, float>::value, 
+                                                         float4, uint4>::type;
 
                 for (uint32_t i = threadIdx.x + (blockIdx.x * VEC_PART_SIZE); i < partEnd; i += blockDim.x) {
                     const VecT t = reinterpret_cast<VecT*>(sort)[i];
@@ -207,6 +194,9 @@ __global__ void RadixUpsweep(
                     uint32_t z = toBits(t.z);
                     uint32_t w = toBits(t.w);
 
+                    // if(i < 5) {
+                    //     printf("First block: [%u %u %u %u]\n", x, y, z, w);
+                    // }
                     atomicAdd(&s_wavesHist[x >> radixShift & RADIX_MASK], 1);
                     atomicAdd(&s_wavesHist[y >> radixShift & RADIX_MASK], 1);
                     atomicAdd(&s_wavesHist[z >> radixShift & RADIX_MASK], 1);
@@ -221,6 +211,9 @@ __global__ void RadixUpsweep(
             {
                 const T t = sort[i];
                 uint32_t bits = toBits(t, radixShift);
+                // if(i < 5) {
+                //     printf("Second block: [%u %u]\n", i, bits);
+                // }
                 atomicAdd(&s_wavesHist[bits >> radixShift & RADIX_MASK], 1);
             }
         }
@@ -324,7 +317,9 @@ __global__ void RadixScan(
     const uint32_t circularLaneShift = getLaneId() + 1 & LANE_MASK;
     const uint32_t partitionsEnd = threadBlocks / blockDim.x * blockDim.x;
     const uint32_t digitOffset = blockIdx.x * threadBlocks;
-
+    if(blockIdx.x < 2 && threadIdx.x < 2) {
+        printf("BlockId[%u] ThreadId[%u]: LaneId[%u] circularShift[%u] partitionEnd[%u] digitOffset[%u]\n", blockIdx.x, threadIdx.x, getLaneId(), circularLaneShift, partitionsEnd, digitOffset);
+    }
     uint32_t i = threadIdx.x;
     for (; i < partitionsEnd; i += blockDim.x)
     {
@@ -390,54 +385,62 @@ __global__ void RadixDownsweepPairs(
     for (uint32_t i = threadIdx.x; i < BIN_HISTS_SIZE; i += blockDim.x)
         s_warpHistograms[i] = 0;
 
-    uint32_t baseIdx = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
-
     //load keys
     T keys[BIN_KEYS_PER_THREAD];
-    uint32_t sortableBits[BIN_KEYS_PER_THREAD];
-
-    if (blockIdx.x < gridDim.x - 1) {
+    if (blockIdx.x < gridDim.x - 1)
+    {
         #pragma unroll
-        for (uint32_t i = 0, t = baseIdx; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT) {
-            keys[i] = t < size ? sort[t] : getTypeMax<T>();
-            sortableBits[i] = toBits(keys[i]);
-        }
-    } else if (blockIdx.x == gridDim.x - 1) {
-        //To handle input sizes not perfect multiples of the partition tile size,
-        //load "dummy" keys, which are keys with the highest possible digit
-        #pragma unroll
-        for (uint32_t i = 0, t = baseIdx; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT) {
-            keys[i] = t < size ? sort[t] : getTypeMax<T>();
-            sortableBits[i] = toBits(keys[i]);
-        }
+        for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            keys[i] = sort[t];
     }
 
-    // WLMS (Work-efficient Local Memory Sort)
+    //To handle input sizes not perfect multiples of the partition tile size,
+    //load "dummy" keys, which are keys with the highest possible digit.
+    //Because of the stability of the sort, these keys are guaranteed to be 
+    //last when scattered. This allows for effortless divergence free sorting
+    //of the final partition.
+    // We'll also incorporate type specific maximum value
+    if (blockIdx.x == gridDim.x - 1)
+    {
+        #pragma unroll
+        for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            keys[i] = t < size ? sort[t] : getTypeMax<T>();
+    }
+    __syncthreads();
+
+    //WLMS
     uint16_t offsets[BIN_KEYS_PER_THREAD];
-     #pragma unroll
-    for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    #pragma unroll
+    for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+    {
         unsigned warpFlags = 0xffffffff;
         #pragma unroll
         for (int k = 0; k < RADIX_LOG; ++k) {
-            const bool t2 = sortableBits[i] >> (k + radixShift) & 1;
+            // Convert to sortable bits before extracting radix
+            uint32_t bits = toBits(keys[i], radixShift);
+            const bool t2 = bits >> k + radixShift & 1;
             warpFlags &= (t2 ? 0 : 0xffffffff) ^ __ballot_sync(0xffffffff, t2);
         }
         const uint32_t bits = __popc(warpFlags & getLaneMaskLt());
         uint32_t preIncrementVal;
         if (bits == 0)
-            preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[(sortableBits[i] >> radixShift) & RADIX_MASK], __popc(warpFlags));
+            preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[toBits(keys[i]) >> radixShift & RADIX_MASK], __popc(warpFlags));
 
         offsets[i] = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
     }
     __syncthreads();
 
-    // Exclusive prefix sum up the warp histograms
-    if (threadIdx.x < RADIX) {
+    //exclusive prefix sum up the warp histograms
+    if (threadIdx.x < RADIX)
+    {
         uint32_t reduction = s_warpHistograms[threadIdx.x];
-        for (uint32_t i = threadIdx.x + RADIX; i < BIN_HISTS_SIZE; i += RADIX) {
+        for (uint32_t i = threadIdx.x + RADIX; i < BIN_HISTS_SIZE; i += RADIX)
+        {
             reduction += s_warpHistograms[i];
             s_warpHistograms[i] = reduction - s_warpHistograms[i];
         }
+
+        //begin the exclusive prefix sum across the reductions
         s_warpHistograms[threadIdx.x] = InclusiveWarpScanCircularShift(reduction);
     }
     __syncthreads();
@@ -451,65 +454,117 @@ __global__ void RadixDownsweepPairs(
     __syncthreads();
 
     //update offsets
-    // Update offsets
-    if (WARP_INDEX) {
+    if (WARP_INDEX)
+    {
         #pragma unroll 
-        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-            const uint32_t t2 = (sortableBits[i] >> radixShift) & RADIX_MASK;
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
             offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
         }
-    } else {
+    }
+    else
+    {
         #pragma unroll
         for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-            offsets[i] += s_warpHistograms[(sortableBits[i] >> radixShift) & RADIX_MASK];
+            offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
     }
 
-    // Load threadblock reductions
-    if (threadIdx.x < RADIX) {
+    //load in threadblock reductions
+    if (threadIdx.x < RADIX)
+    {
         s_localHistogram[threadIdx.x] = globalHist[threadIdx.x + (radixShift << 5)] +
             passHist[threadIdx.x * gridDim.x + blockIdx.x] - s_warpHistograms[threadIdx.x];
     }
     __syncthreads();
 
-    // Scatter keys into shared memory
-    #pragma unroll
-    for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-        s_warpHistograms[offsets[i]] = sortableBits[i];
-    __syncthreads();
-
-    // Scatter runs of keys into device memory
-    uint8_t digits[BIN_KEYS_PER_THREAD];
-    const uint32_t finalPartSize = (blockIdx.x == gridDim.x - 1) ? size - BIN_PART_START : BIN_PART_SIZE;
-
-    // Store the digit of key in register and scatter keys
-    #pragma unroll
-    for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
-        if (t < finalPartSize) {
-            uint32_t bits = s_warpHistograms[t];
-            digits[i] = (bits >> radixShift) & RADIX_MASK;
-            alt[s_localHistogram[digits[i]] + t] = fromBits<T>(bits);
-        }
-    }
-    __syncthreads();
-
-    // Load payloads into registers
-    #pragma unroll
-    for (uint32_t i = 0, t = baseIdx; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT) {
-        if (t < size)
-            keys[i] = sortPayload[t];
-    }
-
-    // Scatter payloads into shared memory
+    //scatter keys into shared memory
     #pragma unroll
     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
         s_warpHistograms[offsets[i]] = keys[i];
     __syncthreads();
 
-    // Scatter the payloads into device
-    #pragma unroll
-    for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
-        if (t < finalPartSize)
+    //scatter runs of keys into device memory
+    uint8_t digits[BIN_KEYS_PER_THREAD];
+    if (blockIdx.x < gridDim.x - 1)
+    {
+        //store the digit of key in register
+        #pragma unroll
+        for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+            ++i, t += blockDim.x)
+        {
+            uint32_t sortableBits = toBits(s_warpHistograms[t], radixShift);
+            digits[i] = sortableBits >> radixShift & RADIX_MASK;
+            alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+        }
+        __syncthreads();
+
+        //Load payloads into registers
+        #pragma unroll
+        for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
+            i < BIN_KEYS_PER_THREAD;
+            ++i, t += LANE_COUNT)
+        {
+            keys[i] = sortPayload[t];
+        }
+
+        //scatter payloads into shared memory
+        #pragma unroll
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            s_warpHistograms[offsets[i]] = keys[i];
+        __syncthreads();
+
+        //Scatter the payloads into device
+        #pragma unroll
+        for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+            ++i, t += blockDim.x)
+        {
             altPayload[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+        }
+    }
+
+    // scatter with size check
+    if (blockIdx.x == gridDim.x - 1)
+    {
+        const uint32_t finalPartSize = size - BIN_PART_START;
+        //store the digit of key in register
+        #pragma unroll
+        for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+            ++i, t += blockDim.x)
+        {
+            if (t < finalPartSize)
+            {
+                uint32_t sortableBits = toBits(s_warpHistograms[t], radixShift);
+                digits[i] = sortableBits >> radixShift & RADIX_MASK;
+                alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+            }
+        }
+        __syncthreads();
+
+        //Load payloads into registers
+        #pragma unroll
+        for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
+            i < BIN_KEYS_PER_THREAD;
+            ++i, t += LANE_COUNT)
+        {
+            if(t < size)
+                keys[i] = sortPayload[t];
+        }
+
+        //scatter payloads into shared memory
+        #pragma unroll
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            s_warpHistograms[offsets[i]] = keys[i];
+        __syncthreads();
+
+        //Scatter the payloads into device
+        #pragma unroll
+        for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+            ++i, t += blockDim.x)
+        {
+            if(t < finalPartSize)
+                altPayload[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+        }
     }
 }
 
@@ -520,35 +575,16 @@ static inline uint32_t divRoundUp(uint32_t x, uint32_t y) {
 
 
 template <typename T>
-void radix(
-    uint32_t k_maxSize,
-    T* m_sort_h,
-    uint32_t* m_sortPayload_h
-) {
+void radix() {
+    srand(time(NULL));
 
+    const uint32_t k_maxSize = 7680;
     const uint32_t k_radix = RADIX;
     const uint32_t k_radixPasses = sizeof(uint32_t);
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-
-    // Calculate optimal threads based on device properties
-    uint32_t upsweepThreads = min(256u, (uint32_t)prop.maxThreadsPerBlock);
-    uint32_t scanThreads = min(256u, (uint32_t)prop.maxThreadsPerBlock);
-    uint32_t downsweepThreads = min(512u, (uint32_t)prop.maxThreadsPerBlock);
-
-    // const uint32_t k_partitionSize = PART_SIZE;
-    // Calculate optimal partition sizes
-    uint32_t maxSharedMemPerBlock = prop.sharedMemPerBlock;
-    uint32_t numSMs = prop.multiProcessorCount;
-    uint32_t partitionSize = max(2048u, ((maxSharedMemPerBlock / sizeof(uint32_t)) / RADIX) * 
-                              (ITEMS_PER_THREAD * WARP_SIZE));
-
-    uint32_t subPartitionSize = params.partitionSize / 
-                                 (params.downsweepThreads / WARP_SIZE);
-    // const uint32_t k_upsweepThreads = 128;
-    // const uint32_t k_scanThreads = 128;
-    // const uint32_t k_downsweepThreads = 512;
+    const uint32_t k_partitionSize = PART_SIZE;
+    const uint32_t k_upsweepThreads = 128;
+    const uint32_t k_scanThreads = 128;
+    const uint32_t k_downsweepThreads = 512;
 
     T* m_sort;
     uint32_t* m_sortPayload;
@@ -558,8 +594,6 @@ void radix(
     uint32_t* m_passHistogram;
 
     const uint32_t threadblocks = divRoundUp(k_maxSize, k_partitionSize);
-
-    printf("\nNum thread blocks for %u is %u\n", k_maxSize, threadblocks);
 
     uint32_t sortsize = k_maxSize * sizeof(T);
     uint32_t payloadsize = k_maxSize * sizeof(uint32_t);
@@ -573,24 +607,28 @@ void radix(
     cudaMalloc(&m_passHistogram, threadblocks * k_radix * sizeof(uint32_t)); // Local histogram - scanned offset from current pass?
 
     
-    // // Create some data
-    // T *msort_H = (T*)malloc(sortsize);
-    // uint32_t *mayload_H = (uint32_t*)malloc(payloadsize);
-    
+    // Create some data
+    T *msort_H = (T*)malloc(sortsize);
+    uint32_t *mayload_H = (uint32_t*)malloc(payloadsize);
+    for(int i = 0; i < k_maxSize; i++) {
+        // msort_H[i] = static_cast<T>(randnum(0, k_maxSize));
+        msort_H[i] = static_cast<T>(i);
+        mayload_H[i] = static_cast<uint32_t>(i);
+    }
 
-    // printf("\nBEFORE[20] .........................\n");
-    // for(int i=0; i < 200; i++) {
-    //     if(std::is_same<T, uint32_t>::value) {
-    //         printf("[%u ", m_sort_h[i]);
-    //     } else if(std::is_same<T, float>::value) {
-    //         printf("[%f ", m_sort_h[i]);
-    //     }
-    //     printf("%u] ", m_sortPayload_h[i]);
-    // }
-    // printf("\n.....................................\n");
+    printf("\nBEFORE[200] .........................\n");
+    for(int i=0; i < 200; i++) {
+        if(std::is_same<T, uint32_t>::value) {
+            printf("[%u ", msort_H[i]);
+        } else if(std::is_same<T, float>::value) {
+            printf("[%f ", msort_H[i]);
+        }
+        printf("%u] ", mayload_H[i]);
+    }
+    printf("\n.....................................\n");
 
-    cudaMemcpy(m_sort, m_sort_h, sortsize, cudaMemcpyHostToDevice);
-    cudaMemcpy(m_sortPayload, m_sortPayload_h, payloadsize, cudaMemcpyHostToDevice);
+    cudaMemcpy(m_sort, msort_H, sortsize, cudaMemcpyHostToDevice);
+    cudaMemcpy(m_sortPayload, mayload_H, payloadsize, cudaMemcpyHostToDevice);
 
     cudaMemset(m_globalHistogram, 0, k_radix * k_radixPasses * sizeof(uint32_t));
     cudaDeviceSynchronize();
@@ -598,9 +636,45 @@ void radix(
 
     for(uint32_t shift=0; shift < k_radixPasses; shift++) {
         uint32_t pass = shift * 8;
-        RadixUpsweep<T> <<<threadblocks, upsweepThreads>>> (m_sort, m_globalHistogram, m_passHistogram, k_maxSize, pass, partitionSize);
-        RadixScan <<<k_radix, scanThreads>>> (m_passHistogram, threadblocks);
-        RadixDownsweepPairs<T> <<<threadblocks, downsweepThreads>>> (m_sort, m_sortPayload, m_alt, m_altPayload,
+        RadixUpsweep<T> <<<threadblocks, k_upsweepThreads>>> (m_sort, m_globalHistogram, m_passHistogram, k_maxSize, pass);
+        {
+
+            uint32_t pass_hist_size = k_radix * sizeof(uint32_t) * threadblocks;
+            // Copy old state
+            uint32_t* passHistBefore = (uint32_t*)malloc(pass_hist_size);
+            // 10 elements of pass hist
+            for(int i = 0; i < 10; i++) {
+                printf("PassHist@[%d]: passHistBefore[%u]\n", i, passHistBefore[i]);
+            }
+            cudaMemcpy(passHistBefore, m_passHistogram, pass_hist_size, cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
+            RadixScan <<<k_radix, k_scanThreads>>> (m_passHistogram, threadblocks);
+
+            // Copy new state
+            uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
+            // uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
+            cudaMemcpy(passHistGpu, m_passHistogram, pass_hist_size, cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
+
+            // for (uint32_t r = 0; r < RADIX; r++) {
+            //     uint32_t offset = r * threadblocks;
+                
+            //     for (uint32_t i = 0; i < threadblocks; i++) {
+            //         // if(r > 1 && r < 4)
+            //             printf("Info@partition %u, index %u: GPU = %u\n", r, i, passHistGpu[offset + i]);
+            //         // if (passHistGpu[offset + i] != passHistCpu[offset + i]) {
+            //         //     errors += 1;
+            //         //     if(errors < 10)
+            //         //         printf("Mismatch at partition %u, index %u: GPU = %u, CPU = %u\n", r, i, passHistGpu[offset + i], passHistCpu[offset + i]);
+            //         // }
+            //     }
+            // }
+
+            free(passHistBefore);
+            free(passHistGpu);
+            // free(passHistCpu);
+        }
+        RadixDownsweepPairs<T> <<<threadblocks, k_downsweepThreads>>> (m_sort, m_sortPayload, m_alt, m_altPayload,
             m_globalHistogram, m_passHistogram, k_maxSize, pass);
 
         std::swap(m_sort, m_alt);
@@ -609,38 +683,34 @@ void radix(
 
     cudaDeviceSynchronize();
 
-    T *m_sort_res = (T*)malloc(sortsize);
-    uint32_t *m_sortPayload_res = (uint32_t*)malloc(payloadsize);
+    T *m_sort_h = (T*)malloc(sortsize);
+    uint32_t *m_payl_h = (uint32_t*)malloc(payloadsize);
 
-    cudaMemcpy(m_sort_res, m_sort, sortsize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(m_sortPayload_res, m_sortPayload, payloadsize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(m_sort_h, m_sort, sortsize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(m_payl_h, m_sortPayload, payloadsize, cudaMemcpyDeviceToHost);
 
     // Validate
-    printf("\nAFTER .........................\n");
-    T last = m_sort_res[0];
+    printf("\nAFTER[200] .........................\n");
+    T last = m_sort_h[0];
     uint32_t err = 0;
-    
-    for(uint32_t i=1; i < k_maxSize; ++i) {
-        T current = m_sort_res[i];
-        uint32_t idx_sorted = m_sortPayload_res[i];
-        T original = static_cast<T>(200000);
-        if (idx_sorted < k_maxSize)
-            original = m_sort_h[idx_sorted];
 
+    for(int i=1; i < k_maxSize; ++i) {
         // if last one is greater than current one, or value at sorted index in original array != current value, its an error
-        if(last > current || current != original) {
-            err += 1;
-            if(err < 10 && std::is_same<T, float>::value) {
-                printf("Error@%u: Last[%f] Current[%f] OriginIdx[%u] Val@Origin[%f]\n", i, last, current, idx_sorted, original);
-                printf("Last <= current %d\npaylodidx < k_maxSize: %d\norigin == current: %d\n", last <= current, idx_sorted < k_maxSize, current == original);
-            }
+        if(last <= m_sort_h[i] && msort_H[m_payl_h[i]] == m_sort_h[i]) {
+            last = m_sort_h[i];
+            continue;
         }
-        last = current;
+        err += 1;
+        if(err < 10 && std::is_same<T, float>::value) {
+            printf("Error[%d]: Index[%d] Last[%f] Current[%f] Val@Origin[%f] last.le(cur)[%d]\n", i, m_payl_h[i], last, m_sort_h[i], msort_H[m_payl_h[i]], last <= m_sort_h[i]);
+        }
     }
     printf("\n.....................................\n");
 
 
     // Free memories
+    free(msort_H);
+    free(mayload_H);
 
     cudaFree(m_sort);
     cudaFree(m_alt);
@@ -649,45 +719,16 @@ void radix(
     cudaFree(m_globalHistogram);
     cudaFree(m_passHistogram);
 
-    free(m_sort_res);
-    free(m_sortPayload_res);
+    free(m_sort_h);
+    free(m_payl_h);
 
-    printf("Size %u with %u errors", k_maxSize, err);
-}
-
-void bit_32_data(uint32_t size, uint32_t* data, uint32_t* idxs) {
-    for(uint32_t i = 0; i < size; i++) {
-        data[i] = static_cast<uint32_t>(randnum(0, size));
-        idxs[i] = static_cast<uint32_t>(i);
-    }
+    printf("%u errors", err);
 }
 
 int main() {
-    const int N_TESTS = 2;
-    uint32_t sizes[N_TESTS] = { 7680, 15360 };
-    // uint32_t sizes[N_TESTS] = { 7680, 8192 };
-    // uint32_t sizes[N_TESTS] = { 7936 };
-    for(int i=0; i<N_TESTS; i++) {
-        // First for 32 bits
-        uint32_t* data = (uint32_t*)malloc(sizes[i] * sizeof(uint32_t));
-        uint32_t* idxs = (uint32_t*)malloc(sizes[i] * sizeof(uint32_t));
-
-        bit_32_data(sizes[i], data, idxs);
-        printf("\nTesting for size[%u] uint32_t", sizes[i]);
-        // Test uint32_t
-        radix<uint32_t>(sizes[i], data, idxs);
-
-        // Test float
-        // cast uint32_t to float
-        float* float_data = (float*)malloc(sizes[i] * sizeof(float));
-        for(uint32_t j=0; j<sizes[i]; j++) {
-            float_data[j] = static_cast<float>(data[j]);
-        }
-        free(data);
-        printf("\nTesting for size[%u] float", sizes[i]);
-        radix<float>(sizes[i], float_data, idxs);
-        free(float_data);
-    }
-    
+    // Test uint32_t
+    radix<uint32_t>();
+    // Test float
+    // radix<float>();
     return 0;
 }
