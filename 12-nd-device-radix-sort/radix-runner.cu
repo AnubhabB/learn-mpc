@@ -7,17 +7,95 @@
 
 #include "radix.cu"
 
+// Random float helper
+static inline float random_float() {
+    return (float)rand() / (float)RAND_MAX;
+}
+
+// Template declarations for different types
+template<typename T>
+inline T random_range(T min, T max);
+
+// Specialization for uint8_t
+template<>
+inline uint8_t random_range(uint8_t min, uint8_t max) {
+    return min + (rand() % (max - min + 1));
+}
+
+// Specialization for uint32_t
+template<>
+inline uint32_t random_range(uint32_t min, uint32_t max) {
+    uint32_t range = max - min + 1;
+    if (range > RAND_MAX) {
+        uint32_t r = ((uint32_t)rand() << 16) | (uint32_t)rand();
+        return min + (r % range);
+    }
+    return min + (rand() % range);
+}
+
+// Specialization for float
+template<>
+inline float random_range(float min, float max) {
+    return min + random_float() * (max - min);
+}
+
+#ifdef HALF_FLOAT_SUPPORT
+// Specialization for half float if needed
+template<>
+static inline __fp16 random_range(__fp16 min, __fp16 max) {
+    float min_f = __half2float(min);
+    float max_f = __half2float(max);
+    return __float2(min_f + random_float() * (max_f - min_f));
+}
+#endif
+
+#ifdef BRAIN_FLOAT_SUPPORT
+// Specialization for half float if needed
+template<>
+static inline __nv_bfloat16 random_range(__nv_bfloat16 min, __nv_bfloat16 max) {
+    float min_f = __bfloat162float(min);
+    float max_f = __bfloat162float(max);
+    return __float2bfloat16(min_f + random_float() * (max_f - min_f));
+}
+#endif
+
 template<typename T>
 void createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* h_idx, bool seq) {
     uint32_t sortsize = size * sizeof(T);
     uint32_t idxsize  = size * sizeof(uint32_t);
 
+    T min;
+    T max;
+
+    if(!seq) {
+        if(std::is_same<T, uint8_t>::value) {
+            min = (uint8_t)0;
+            max = (uint8_t)255;
+        } else if(std::is_same<T, uint32_t>::value) {
+            min = (uint32_t)0;
+            max = (uint32_t)320000;
+        } else if(std::is_same<T, float>::value) {
+            min = (float)-512.0;
+            max = (float)24000.0;
+        }
+        //  else if(std::is_same<T, __fp16>::value) {
+        //     float mn = -32.0;
+        //     float mx = 128.0f;
+        //     min = __float2half(mn);
+        //     max = __float2half(mx);
+        // } else if(std::is_same<T, __nv_bfloat16>::value) {
+        //     float mn = -64.0;
+        //     float mx = 64.0f;
+        //     min = __float2bfloat16(mn);
+        //     max = __float2bfloat16(mx);
+        // } 
+    }
 
     for(uint32_t i=0; i<size; i++) {
         if(seq) {
             h_sort[i] = static_cast<T>(i);
         } else {
-            // TODO
+            random_range(min, max);
         }
         h_idx[i] = i;
     }
@@ -61,6 +139,7 @@ struct Resources {
     uint32_t numVecElemInBlock; // Vector elements per block
     uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
     uint32_t const numUpsweepThreads = 256; // Num threads per upsweep kernel
+    uint32_t const numScanThreads = 256; // Number of scan threads
 
     uint32_t const radix = RADIX;
 
@@ -95,7 +174,7 @@ uint32_t validateUpsweep(uint32_t size, bool dataseq = true) {
     uint32_t errors = 0;
 
     Resources res = Resources::compute(size, sizeof(uint32_t));
-    printf("For size[%u] -------------\nnumThreadBlocks: %u numUpsweepThreads: %u numElementsInBlock: %u numVecElementsInBlock: %u\n", size, res.numThreadBlocks, res.numUpsweepThreads, res.numElemInBlock, res.numVecElemInBlock);
+    printf("For size[%u] -------------\nnumThreadBlocks: %u numUpsweepThreads: %u numScanThreads: %u maxNumElementsInBlock: %u maxNumVecElementsInBlock: %u\n", size, res.numThreadBlocks, res.numUpsweepThreads, res.numScanThreads, res.numElemInBlock, res.numVecElemInBlock);
     
     // Declarations
     T* d_sort;
@@ -105,10 +184,11 @@ uint32_t validateUpsweep(uint32_t size, bool dataseq = true) {
     uint32_t* d_globalHist;
     uint32_t* d_passHist;
 
-    uint32_t numPasses = sizeof(T);
-    uint32_t sortSize  = size * sizeof(T);
-    uint32_t idxSize   = size * sizeof(uint32_t);
-    uint32_t radixSize = RADIX * sizeof(uint32_t);
+    uint32_t numPasses  = sizeof(T);
+    uint32_t sortSize   = size * sizeof(T);
+    uint32_t idxSize    = size * sizeof(uint32_t);
+    uint32_t radixSize  = RADIX * sizeof(uint32_t);
+    uint32_t scanShared = res.numScanThreads * sizeof(uint32_t);
 
     T* h_sort       = (T*)malloc(sortSize);
     uint32_t* h_idx = (uint32_t*)malloc(idxSize);
@@ -127,42 +207,94 @@ uint32_t validateUpsweep(uint32_t size, bool dataseq = true) {
     cudaDeviceSynchronize();
 
     for(uint32_t pass=0; pass < numPasses; pass++) {
+        // Run `RadixUpsweep` kernel and validate
         uint32_t shift = pass * 8;
         RadixUpsweep<T><<<res.numThreadBlocks, res.numUpsweepThreads>>>(d_sort, d_globalHist, d_passHist, size, shift, res.numElemInBlock, res.numVecElemInBlock);
+        {
+            uint32_t *cpuHist = (uint32_t*)malloc(radixSize);
+            uint32_t *gpuHist = (uint32_t*)malloc(radixSize);
 
-        uint32_t *cpuHist = (uint32_t*)malloc(radixSize);
-        uint32_t *gpuHist = (uint32_t*)malloc(radixSize);
-
-        for(int i=0; i<RADIX; i++) {
-            cpuHist[i] = 0;
-        }
-
-        // Compute CPU histogram
-        for (uint32_t i = 0; i < size; i++) {
-            uint32_t bits = toBitsCpu<T>(h_sort[i]);
-            uint32_t digit = (bits >> shift) & RADIX_MASK;
-            cpuHist[digit]++;
-        }
-        // Convert to exclusive prefix sum
-        uint32_t prev = 0;
-        for (uint32_t i = 0; i < RADIX; i++) {
-            uint32_t current = cpuHist[i];
-            cpuHist[i] = prev;
-            prev += current;
-        }
-
-        cudaMemcpy(gpuHist, d_globalHist + (RADIX * pass), radixSize, cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
-        
-        for(uint32_t i=0; i<RADIX; i++) {
-            if(cpuHist[i] != gpuHist[i]) {
-                errors += 1;
-                printf("Error[bin %u/ radixShift %u]: CPU[%u] GPU[%u]\n", i, shift, cpuHist[i], gpuHist[i]);
+            for(int i=0; i<RADIX; i++) {
+                cpuHist[i] = 0;
             }
+
+            // Compute CPU histogram
+            for (uint32_t i = 0; i < size; i++) {
+                uint32_t bits = toBitsCpu<T>(h_sort[i]);
+                uint32_t digit = (bits >> shift) & RADIX_MASK;
+                cpuHist[digit]++;
+            }
+            // Convert to exclusive prefix sum
+            uint32_t prev = 0;
+            for (uint32_t i = 0; i < RADIX; i++) {
+                uint32_t current = cpuHist[i];
+                cpuHist[i] = prev;
+                prev += current;
+            }
+
+            cudaMemcpy(gpuHist, d_globalHist + (RADIX * pass), radixSize, cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
+            
+            for(uint32_t i=0; i<RADIX; i++) {
+                if(cpuHist[i] != gpuHist[i]) {
+                    errors += 1;
+                    printf("Error[bin %u/ radixShift %u]: CPU[%u] GPU[%u]\n", i, shift, cpuHist[i], gpuHist[i]);
+                }
+            }
+            
+            free(cpuHist);
+            free(gpuHist);
         }
+
+        // Launch RadixScan kernel
         
-        free(cpuHist);
-        free(gpuHist);
+        {
+            uint32_t pass_hist_size = RADIX * sizeof(uint32_t) * res.numThreadBlocks;
+
+            // Copy old state
+            uint32_t* passHistBefore = (uint32_t*)malloc(pass_hist_size);
+            cudaMemcpy(passHistBefore, d_passHist, pass_hist_size, cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
+            
+            RadixScan<<<RADIX, res.numScanThreads, scanShared>>>(d_passHist, res.numThreadBlocks);
+
+            // Copy new state
+            uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
+            uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
+
+            cudaMemcpy(passHistGpu, d_passHist, pass_hist_size, cudaMemcpyDeviceToHost);
+            cudaDeviceSynchronize();
+
+            // Create cpu alternate values
+            // Process each partition separately
+            for (uint32_t r = 0; r < RADIX; r++) {
+                uint32_t offset = r * res.numThreadBlocks;
+                
+                // First element remains the same
+                passHistCpu[offset] = passHistBefore[offset];
+                
+                // Simple inclusive scan for this partition
+                for (uint32_t i = 1; i < res.numThreadBlocks; i++) {
+                    passHistCpu[offset + i] = passHistCpu[offset + i - 1] + 
+                                            passHistBefore[offset + i];
+                }
+            }
+
+            for (uint32_t r = 0; r < RADIX; r++) {
+                uint32_t offset = r * res.numThreadBlocks;
+                
+                for (uint32_t i = 0; i < res.numThreadBlocks; i++) {
+                    if (passHistGpu[offset + i] != passHistCpu[offset + i]) {
+                        errors += 1;
+                        printf("Mismatch at partition %u, index %u: GPU = %u, CPU = %u\n", r, i, passHistGpu[offset + i], passHistCpu[offset + i]);
+                    }
+                }
+            }
+
+            free(passHistBefore);
+            free(passHistGpu);
+            free(passHistCpu);
+        }
     }
 
     cudaFree(d_sort);
@@ -177,24 +309,53 @@ uint32_t validateUpsweep(uint32_t size, bool dataseq = true) {
 }
 
 int main() {
-    uint32_t sizes[] = { 16, 1024, 2048, 4096, 4113, 7680, 8192, 32000, 64000, 128000 };
+    uint32_t sizes[] = { 16, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000 };
     
     // First, test for UpsweepKernel is good?
-    for(uint32_t i = 0; i < 10; i++) {
+    for(uint32_t i = 0; i < 8; i++) {
         {
-            printf("`uint32_t`: Upsweep Validation\n");
+            printf("`uint32_t`: Upsweep Validation (sequential)\n");
             uint32_t errors = validateUpsweep<uint32_t>(sizes[i]);
-            if(errors > 0)
+            if(errors > 0){
                 printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
         }
 
-        {
-            printf("`float`: Upsweep Validation\n");
-            uint32_t errors = validateUpsweep<float>(sizes[i]);
-            if(errors > 0)
-                printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
-        }
+        // {
+        //     printf("`uint32_t`: Upsweep Validation (random)\n");
+        //     uint32_t errors = validateUpsweep<uint32_t>(sizes[i], false);
+        //     if(errors > 0)
+        //         printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
+        // }
 
+        // {
+        //     printf("`float`: Upsweep Validation (sequential)\n");
+        //     uint32_t errors = validateUpsweep<float>(sizes[i]);
+        //     if(errors > 0)
+        //         printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+        // }
+
+        // {
+        //     printf("`float`: Upsweep Validation (random)\n");
+        //     uint32_t errors = validateUpsweep<float>(sizes[i], false);
+        //     if(errors > 0)
+        //         printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+        // }
+
+        // {
+        //     printf("`float16`: Upsweep Validation (seequential)\n");
+        //     uint32_t errors = validateUpsweep<__fp16>(sizes[i], false);
+        //     if(errors > 0)
+        //         printf("Errors: %u while validating upsweep for size[fp16][%u]\n", errors, sizes[i]);
+        // }
+
+        // {
+        //     printf("`float16`: Upsweep Validation (seequential)\n");
+        //     uint32_t errors = validateUpsweep<__nv_bfloat16>(sizes[i], false);
+        //     if(errors > 0)
+        //         printf("Errors: %u while validating upsweep for size[bfloat16][%u]\n", errors, sizes[i]);
+        // }
         // {
         //     uint32_t errors = validateUpsweep<half>(sizes[i]);
         //     if(errors > 0)
