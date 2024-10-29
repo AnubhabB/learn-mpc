@@ -3,11 +3,18 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#define N_THREADS           256
 #define RADIX               256             //Number of digit bins
 #define WARP_SIZE           32
 #define LANE_LOG            5               // LANE_LOG = 5 since 2^5 = 32 = warp size
+#define RADIX_LOG           8
+
 #define LANE_MASK           (WARP_SIZE - 1)
 #define RADIX_MASK          (RADIX - 1)     //Mask of digit bins, to extract digits
+#define WARP_INDEX          (threadIdx.x >> LANE_LOG)
+
+#define BIN_KEYS_PER_THREAD 15
+#define SUB_PARTITION_SIZE (BIN_KEYS_PER_THREAD * WARP_SIZE);
 
 __device__ __forceinline__ uint32_t getLaneId() {
     uint32_t laneId;
@@ -126,6 +133,33 @@ struct alignas(16) Vector {  // Align to 16 bytes for optimal memory access
     __device__ __host__ const T& operator[](int i) const { return data[i]; }
 };
 
+// Helper function to get type-specific maximum value
+template<typename T>
+__device__ inline T getTypeMax() {
+    if constexpr (std::is_same<T, float>::value) {
+        return INFINITY;
+    }
+    else if constexpr (std::is_same<T, __half>::value) {
+        return __float2half(INFINITY);
+    }
+    else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        return __float2bfloat16(INFINITY);
+    }
+    else if constexpr (std::is_same<T, int64_t>::value) {
+        return 0x7FFFFFFFFFFFFFFF;
+    } else if constexpr (std::is_same<T, unsigned char>::value) {
+        return 0xFF; // 255 in hex
+    } else if constexpr (std::is_same<T, u_int32_t>::value) {
+        return 0xFFFFFFFF;  // 4294967295 in hex
+    } else {
+        // This seems to be experimental
+        // calling a constexpr __host__ function("max") from a __device__ function("getTypeMax") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
+        
+        // Shouldn't reach here
+        return static_cast<T>(-1);
+    }
+}
+
 
 template<typename T>
 __global__ void RadixUpsweep(
@@ -206,7 +240,6 @@ __global__ void RadixUpsweep(
 }
 
 
-
 // TODO: optimize this with shared memory
 __global__ void RadixScan(
     uint32_t* passHist,
@@ -250,76 +283,56 @@ __global__ void RadixScan(
     }
 }
 
-// __device__ __forceinline__ uint32_t warpInclusiveScan(uint32_t val) {
-//     #pragma unroll
-//     for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
-//         uint32_t temp = __shfl_up_sync(0xffffffff, val, offset);
-//         if (getLaneId() >= offset) {
-//             val += temp;
-//         }
-//     }
-//     return val;
-// }
+template<typename T>
+__global__ void RadixDownsweep(
+    T* sort,
+    T* sortAlt,
+    uint32_t* payload,
+    uint32_t* payloadAlt,
+    uint32_t* globalHist,
+    uint32_t* passHist,
+    const uint32_t size,
+    const uint32_t radixShift
+) {
+    constexpr uint32_t s_histSize   = RADIX * (N_THREADS / WARP_SIZE);
+    constexpr uint32_t elemPerBlock = N_THREADS * BIN_KEYS_PER_THREAD;
+    constexpr uint32_t elemPerWarp  = WARP_SIZE * BIN_KEYS_PER_THREAD;
+    
+    // Shared memory histogram
+    __shared__ uint32_t s_warpHistograms[s_histSize];
+    __shared__ uint32_t s_localHistogram[RADIX];
 
-// __global__ void RadixScan(
-//     uint32_t* passHist,
-//     const uint32_t threadBlocks
-// ) {
-//     extern __shared__ uint32_t s_scan[];
-    
-//     const uint32_t lane_id = getLaneId();
-//     const uint32_t digit_offset = blockIdx.x * threadBlocks;
+    // Each warp's histogram section
+    volatile uint32_t* s_warpHist = &s_warpHistograms[WARP_INDEX << RADIX_LOG];
 
-//     // Special case for small thread blocks
-//     if (threadBlocks <= WARP_SIZE) {
-//         if (lane_id < threadBlocks) {
-//             uint32_t val = passHist[digit_offset + lane_id];
-            
-//             // Perform scan within the first warp
-//             val = warpInclusiveScan(val);
-            
-//             // Write back
-//             passHist[digit_offset + lane_id] = val;
-//         }
-//         return;
-//     }
+    //clear shared memory
+    for (uint32_t i = threadIdx.x; i < s_histSize; i += blockDim.x)
+        s_warpHistograms[i] = 0;
+
+    //load keys
+    T keys[BIN_KEYS_PER_THREAD];
+
+    // Calculate base index for this block
+    uint32_t blockStart = blockIdx.x * elemPerBlock;
+    // Calculate base index for this warp within the block
+    uint32_t warpStart = blockStart + (WARP_INDEX * elemPerWarp);
+    // Calculate thread's starting position within warp
+    uint32_t threadStart = warpStart + getLaneId();
     
-//     // Regular case for larger thread blocks
-//     const uint32_t warp_id = threadIdx.x >> LANE_LOG;
-    
-//     // Step 1: Load data into shared memory
-//     uint32_t val = 0;
-//     if (threadIdx.x < threadBlocks) {
-//         val = passHist[digit_offset + threadIdx.x];
-//     }
-//     s_scan[threadIdx.x] = val;
-//     __syncthreads();
-    
-//     // Step 2: Perform intra-warp scan
-//     val = warpInclusiveScan(val);
-//     s_scan[threadIdx.x] = val;
-//     __syncthreads();
-    
-//     // Step 3: Collect last elements from each warp
-//     if (lane_id == WARP_SIZE-1 && warp_id < (threadBlocks + WARP_SIZE - 1) / WARP_SIZE) {
-//         uint32_t warp_result = s_scan[threadIdx.x];
-//         s_scan[blockDim.x + warp_id] = warp_result;
-//     }
-//     __syncthreads();
-    
-//     // Step 4: Scan warp results using first warp
-//     if (warp_id == 0 && lane_id < (threadBlocks + WARP_SIZE - 1) / WARP_SIZE) {
-//         uint32_t warp_sum = s_scan[blockDim.x + lane_id];
-//         warp_sum = warpInclusiveScan(warp_sum);
-//         s_scan[blockDim.x + lane_id] = warp_sum;
-//     }
-//     __syncthreads();
-    
-//     // Step 5: Add warp scan results back
-//     if (threadIdx.x < threadBlocks) {
-//         if (warp_id > 0) {
-//             val += s_scan[blockDim.x + warp_id - 1];
-//         }
-//         passHist[digit_offset + threadIdx.x] = val;
-//     }
-// }
+    if (blockStart + elemPerBlock <= size) {
+        // Full block case - no bounds checking needed
+        #pragma unroll
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+            keys[i] = sort[threadStart + i * WARP_SIZE];
+        }
+    } else {
+        // Last block case - needs bounds checking
+        #pragma unroll
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+            uint32_t loadIndex = threadStart + i * WARP_SIZE;
+            keys[i] = loadIndex < size ? sort[loadIndex] : getTypeMax<T>();
+        }
+    }
+
+    __syncthreads();
+}

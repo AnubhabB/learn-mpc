@@ -138,9 +138,9 @@ struct Resources {
     uint32_t numElemInBlock; // Elements per block
     uint32_t numVecElemInBlock; // Vector elements per block
     uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
-    uint32_t numScanThreads; // Number of scan threads
 
-    uint32_t const numUpsweepThreads = 256; // Num threads per upsweep kernel
+    uint32_t const numUpsweepThreads = N_THREADS; // Num threads per upsweep kernel
+    uint32_t const numScanThreads    = N_THREADS; // Num of threads for scan
     uint32_t const radix = RADIX;
 
     static Resources compute(uint32_t size, uint32_t type_size) {
@@ -165,7 +165,6 @@ struct Resources {
 
         res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
 
-        res.numScanThreads = 256;
         return res;
     }
 };
