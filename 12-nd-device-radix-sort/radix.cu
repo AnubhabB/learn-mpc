@@ -7,7 +7,7 @@
 #define RADIX               256             //Number of digit bins
 #define WARP_SIZE           32
 #define LANE_LOG            5               // LANE_LOG = 5 since 2^5 = 32 = warp size
-#define RADIX_LOG           8
+#define RADIX_LOG           8               // 2^8 = 258
 
 #define LANE_MASK           (WARP_SIZE - 1)
 #define RADIX_MASK          (RADIX - 1)     //Mask of digit bins, to extract digits
@@ -20,6 +20,13 @@ __device__ __forceinline__ uint32_t getLaneId() {
     uint32_t laneId;
     asm("mov.u32 %0, %%laneid;" : "=r"(laneId));
     return laneId;
+}
+
+// Gets a bit mask representing all lanes with IDs less than the current thread's lane ID within a warp
+__device__ __forceinline__ unsigned getLaneMaskLt() {
+    unsigned mask;
+    asm("mov.u32 %0, %%lanemask_lt;" : "=r"(mask));
+    return mask;
 }
 
 // Prefix sum
@@ -61,7 +68,7 @@ __device__ __forceinline__ uint32_t ActiveInclusiveWarpScan(uint32_t val) {
     return val;
 }
 
-// Prefix sum of active threads ot including itself
+// Prefix sum of active threads ot excluding itself
 __device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val) {
     const uint32_t mask = __activemask();
     #pragma unroll
@@ -168,8 +175,7 @@ __global__ void RadixUpsweep(
     uint32_t* passHist,
     const uint32_t size,
     const uint32_t radixShift,
-    const uint32_t partSize, // max number of elements being processed by this block
-    const uint32_t vecPartSize // max number of `vector elements` in block
+    const uint32_t numElemsInBlock // max number of elements being processed by this block
 ) {
     // Shared memory for histogram - two sections to avoid bank conflicts
     constexpr uint32_t sharedSize = RADIX * 2;
@@ -182,8 +188,8 @@ __global__ void RadixUpsweep(
     __syncthreads();
 
     // Calculate this block's range
-    const uint32_t block_start = blockIdx.x * partSize;
-    const uint32_t block_end = min(block_start + partSize, size);
+    const uint32_t block_start = blockIdx.x * numElemsInBlock;
+    const uint32_t block_end = min(block_start + numElemsInBlock, size);
     const uint32_t elements_in_block = block_end - block_start;
 
     // Vector load based on types
@@ -285,54 +291,139 @@ __global__ void RadixScan(
 
 template<typename T>
 __global__ void RadixDownsweep(
-    T* sort,
-    T* sortAlt,
-    uint32_t* payload,
-    uint32_t* payloadAlt,
-    uint32_t* globalHist,
-    uint32_t* passHist,
-    const uint32_t size,
-    const uint32_t radixShift
-) {
-    constexpr uint32_t s_histSize   = RADIX * (N_THREADS / WARP_SIZE);
-    constexpr uint32_t elemPerBlock = N_THREADS * BIN_KEYS_PER_THREAD;
-    constexpr uint32_t elemPerWarp  = WARP_SIZE * BIN_KEYS_PER_THREAD;
-    
-    // Shared memory histogram
-    __shared__ uint32_t s_warpHistograms[s_histSize];
-    __shared__ uint32_t s_localHistogram[RADIX];
-
-    // Each warp's histogram section
+    T* sort,              // Input array
+    T* alt,               // Output array
+    uint32_t* globalHist, // Global histogram
+    uint32_t* passHist,   // Pass histogram
+    uint32_t size,        // Total elements to sort
+    uint32_t radixShift)  // Current radix shift amount
+{
+    // Shared memory layout
+    __shared__ uint32_t s_warpHistograms[N_THREADS * BIN_KEYS_PER_THREAD];  // blockDim.x * BIN_KEYS_PER_THREAD
+    __shared__ uint32_t s_localHistogram[RADIX];   // RADIX
     volatile uint32_t* s_warpHist = &s_warpHistograms[WARP_INDEX << RADIX_LOG];
 
     //clear shared memory
-    for (uint32_t i = threadIdx.x; i < s_histSize; i += blockDim.x)
+    for (uint32_t i = threadIdx.x; i < BIN_HISTS_SIZE; i += blockDim.x)
         s_warpHistograms[i] = 0;
 
-    //load keys
-    T keys[BIN_KEYS_PER_THREAD];
-
-    // Calculate base index for this block
-    uint32_t blockStart = blockIdx.x * elemPerBlock;
-    // Calculate base index for this warp within the block
-    uint32_t warpStart = blockStart + (WARP_INDEX * elemPerWarp);
-    // Calculate thread's starting position within warp
-    uint32_t threadStart = warpStart + getLaneId();
+    // // Calculate thread's global position and valid key count
+    // uint32_t thread_start = blockIdx.x * blockDim.x * BIN_KEYS_PER_THREAD + threadIdx.x;
+    // uint32_t valid_keys = min(BIN_KEYS_PER_THREAD, 
+    //                          (size - thread_start + WARP_SIZE - 1) / WARP_SIZE);
     
-    if (blockStart + elemPerBlock <= size) {
-        // Full block case - no bounds checking needed
-        #pragma unroll
-        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-            keys[i] = sort[threadStart + i * WARP_SIZE];
-        }
-    } else {
-        // Last block case - needs bounds checking
-        #pragma unroll
-        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-            uint32_t loadIndex = threadStart + i * WARP_SIZE;
-            keys[i] = loadIndex < size ? sort[loadIndex] : getTypeMax<T>();
-        }
-    }
+    // // Get ballot mask for partially filled warps
+    // uint32_t ballot_mask = getBallotMask(thread_start, size);
 
-    __syncthreads();
+    // // Clear shared memory
+    // for (uint32_t i = threadIdx.x; i < BIN_HISTS_SIZE; i += blockDim.x) {
+    //     s_warpHistograms[i] = 0;
+    // }
+    // __syncthreads();
+
+    // // Load and convert keys
+    // uint32_t keys[BIN_KEYS_PER_THREAD];
+    // #pragma unroll
+    // for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //     uint32_t idx = thread_start + i * WARP_SIZE;
+    //     keys[i] = (idx < size && i < valid_keys) ? toBits<T>(sort[idx]) : 0;
+    // }
+    // __syncthreads();
+
+    // // WLMS - Warp Level Multi Split
+    // uint32_t offsets[BIN_KEYS_PER_THREAD];
+    // #pragma unroll
+    // for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //     unsigned warpFlags = ballot_mask;
+        
+    //     if (i < valid_keys) {
+    //         #pragma unroll
+    //         for (int k = 0; k < RADIX_LOG; ++k) {
+    //             const bool t2 = keys[i] >> (k + radixShift) & 1;
+    //             warpFlags &= (t2 ? 0 : ballot_mask) ^ __ballot_sync(ballot_mask, t2);
+    //         }
+    //     }
+
+    //     const uint32_t bits = __popc(warpFlags & getLaneMaskLt());
+    //     uint32_t preIncrementVal = 0;
+
+    //     // Only the first thread in each digit group updates the histogram
+    //     if (bits == 0 && i < valid_keys) {
+    //         uint32_t digit = keys[i] >> radixShift & RADIX_MASK;
+    //         preIncrementVal = atomicAdd(&s_warpHist[digit], __popc(warpFlags));
+    //     }
+
+    //     // Share the offset with other threads in the same digit group
+    //     offsets[i] = __shfl_sync(ballot_mask, preIncrementVal, __ffs(warpFlags) - 1) + bits;
+        
+    //     // Validate offset is within bounds
+    //     assert(offsets[i] < BIN_PART_SIZE);
+    // }
+    // __syncthreads();
+
+    // // Exclusive prefix sum up the warp histograms
+    // if (threadIdx.x < RADIX) {
+    //     uint32_t reduction = s_warpHistograms[threadIdx.x];
+    //     for (uint32_t i = threadIdx.x + RADIX; i < BIN_HISTS_SIZE; i += RADIX) {
+    //         reduction += s_warpHistograms[i];
+    //         s_warpHistograms[i] = reduction - s_warpHistograms[i];
+    //     }
+
+    //     s_warpHistograms[threadIdx.x] = InclusiveWarpScanCircularShift(reduction);
+    // }
+    // __syncthreads();
+
+    // // Additional prefix sum processing
+    // if (threadIdx.x < (RADIX >> WARP_LOG)) {
+    //     s_warpHistograms[threadIdx.x << WARP_LOG] = 
+    //         ActiveExclusiveWarpScan(s_warpHistograms[threadIdx.x << WARP_LOG]);
+    // }
+    // __syncthreads();
+
+    // // Update offsets based on warp index
+    // if (WARP_INDEX) {
+    //     #pragma unroll 
+    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //         if (i < valid_keys) {
+    //             const uint32_t digit = keys[i] >> radixShift & RADIX_MASK;
+    //             offsets[i] += s_warpHist[digit] + s_warpHistograms[digit];
+    //         }
+    //     }
+    // }
+    // else {
+    //     #pragma unroll
+    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //         if (i < valid_keys) {
+    //             offsets[i] += s_warpHistograms[keys[i] >> radixShift & RADIX_MASK];
+    //         }
+    //     }
+    // }
+
+    // // Load block-level histogram data
+    // if (threadIdx.x < RADIX) {
+    //     s_localHistogram[threadIdx.x] = globalHist[threadIdx.x + (radixShift << 5)] +
+    //         passHist[threadIdx.x * gridDim.x + blockIdx.x] - s_warpHistograms[threadIdx.x];
+    // }
+    // __syncthreads();
+
+    // // Scatter keys to shared memory
+    // #pragma unroll
+    // for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //     if (i < valid_keys) {
+    //         s_warpHistograms[offsets[i]] = keys[i];
+    //     }
+    // }
+    // __syncthreads();
+
+    // // Final scatter to global memory
+    // uint32_t block_items = min(blockDim.x * BIN_KEYS_PER_THREAD, 
+    //                           size - blockIdx.x * blockDim.x * BIN_KEYS_PER_THREAD);
+    
+    // for (uint32_t i = threadIdx.x; i < block_items; i += blockDim.x) {
+    //     uint32_t digit = s_warpHistograms[i] >> radixShift & RADIX_MASK;
+    //     uint32_t global_idx = s_localHistogram[digit] + i;
+    //     if (global_idx < size) {
+    //         // alt[global_idx] = fromBits<T>(s_warpHistograms[i]);
+    //     }
+    // }
 }
