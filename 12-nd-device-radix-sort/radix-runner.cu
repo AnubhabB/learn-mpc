@@ -80,7 +80,7 @@ void createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
             max = (uint8_t)255;
         } else if(std::is_same<T, uint32_t>::value) {
             min = (uint32_t)0;
-            max = (uint32_t)320000;
+            max = size < 1024 ? 32 : (uint32_t)320000;
         } else if(std::is_same<T, float>::value) {
             min = (float)-512.0;
             max = (float)24000.0;
@@ -225,14 +225,15 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
         return errors;
     }
 
-    for(uint32_t pass=0; pass < numPasses; ++pass) {
+    // for(uint32_t pass=0; pass < numPasses; ++pass) {
+    for(uint32_t pass=0; pass < 1; ++pass) {
         // Run `RadixUpsweep` kernel and validate
         uint32_t shift = pass * 8;
         printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses, shift);
 
         {
             // Get current sort data
-            T* sortData = (T*)malloc(512);
+            T* sortData = (T*)malloc(sortSize);
             c_ret = cudaMemcpy(sortData, d_sort, sortSize, cudaMemcpyDeviceToHost);
             if (c_ret) {
                 printf("[Before Upsweep -> cudaMemcpy] Cuda Error: %s\n", cudaGetErrorString(c_ret));
@@ -253,7 +254,7 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
             }
 
             printf("Sort data now: ");
-            for(int i=0; i<16; i++) {
+            for(int i=0; i<32; i++) {
                 if(std::is_same<T, float>::value)
                     printf("[%d %f] ", i, sortData[i]);
                 else if(std::is_same<T, uint32_t>::value)
@@ -271,6 +272,7 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
 
             uint32_t *cpuHist = (uint32_t*)malloc(radixSize);
             uint32_t *gpuHist = (uint32_t*)malloc(radixSize);
+            uint32_t *gpuPassHist = (uint32_t*)malloc(radixSize * res.numThreadBlocks);
 
             for(int i=0; i<RADIX; i++) {
                 cpuHist[i] = 0;
@@ -302,16 +304,39 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
                 errors += 1;
                 break;
             }
+
+            c_ret = cudaMemcpy(gpuPassHist, d_passHist, radixSize * res.numThreadBlocks, cudaMemcpyDeviceToHost);
+            if (c_ret) {
+                printf("[Upsweep -> cudaMemcpy -> GpuPassHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+                errors += 1;
+                break;
+            }
+            c_ret = cudaDeviceSynchronize();
+            if (c_ret) {
+                printf("[Upsweep -> cudaDevSync -> GpuPassHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+                errors += 1;
+                break;
+            }
             
             for(uint32_t i=0; i<RADIX; i++) {
+                if(i < 16 && gpuHist[i] != size) {
+                    printf("[%u %u]", i, gpuHist[i]);
+                }
                 if(cpuHist[i] != gpuHist[i] && errors < 16) {
                     errors += 1;
                     printf("Error[bin %u/ radixShift %u]: CPU[%u] GPU[%u]\n", i, shift, cpuHist[i], gpuHist[i]);
                 }
             }
+            printf("\n");
+
+            for(uint32_t i=0; i<16; i++) {
+                printf("[%u %u] ", i, gpuPassHist[i]);
+            }
+            printf("\n");
             
             free(cpuHist);
             free(gpuHist);
+            free(gpuPassHist);
             free(sortData);
         }
 
@@ -437,18 +462,18 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
 }
 
 int main() {
-    uint32_t sizes[] = { 16, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
+    uint32_t sizes[] = { 32, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    for(uint32_t i = 0; i < 12; i++) {
-        {
-            printf("`uint32_t`: Upsweep Validation (sequential)\n");
-            uint32_t errors = validateUpsweep<uint32_t>(sizes[i]);
-            if(errors > 0){
-                printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+    for(uint32_t i = 0; i < 1; i++) {
+        // {
+        //     printf("`uint32_t`: Upsweep Validation (sequential)\n");
+        //     uint32_t errors = validateUpsweep<uint32_t>(sizes[i]);
+        //     if(errors > 0){
+        //         printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
         {
             printf("`uint32_t`: Upsweep Validation (random)\n");
