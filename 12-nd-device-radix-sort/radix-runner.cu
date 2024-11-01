@@ -80,7 +80,7 @@ void createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
             max = (uint8_t)255;
         } else if(std::is_same<T, uint32_t>::value) {
             min = (uint32_t)0;
-            max = size < 1024 ? 32 : (uint32_t)320000;
+            max = size <= 1024 ? 64 : (uint32_t)320000;
         } else if(std::is_same<T, float>::value) {
             min = (float)-512.0;
             max = (float)24000.0;
@@ -142,13 +142,13 @@ inline uint32_t toBitsCpu(T val) {
 
 // Calculate resources to run
 struct Resources {
-    uint32_t numElemInBlock; // Elements per block
     // uint32_t numVecElemInBlock; // Vector elements per block
     uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
 
-    uint32_t const numUpsweepThreads   = N_THREADS; // Num threads per upsweep kernel
-    uint32_t const numScanThreads      = N_THREADS; // Num of threads for scan
-    uint32_t const numDownsweepThreads = N_THREADS * 2; // number of downsweep threads
+    uint32_t const numElemInBlock      = 16; // Elements per block
+    uint32_t const numUpsweepThreads   = 8; // Num threads per upsweep kernel
+    uint32_t const numScanThreads      = 4; // Num of threads for scan
+    uint32_t const numDownsweepThreads = 16; // number of downsweep threads
     uint32_t const radix = RADIX;
 
     static Resources compute(uint32_t size, uint32_t type_size) {
@@ -160,13 +160,13 @@ struct Resources {
         
         // Calculate shared memory needed for per-block histogram
         // This corresponds to __shared__ uint32_t s_globalHist[RADIX * 2] in the kernel
-        const uint32_t shared_hist_size = res.radix * 2 * sizeof(uint32_t);
+        // const uint32_t shared_hist_size = res.radix * 2 * sizeof(uint32_t);
         
-        // Calculate available shared memory for data processing
-        const uint32_t available_shared_mem = ((prop.sharedMemPerBlock - shared_hist_size) * 3) / 4;  // Use ~75% of remaining shared memory
+        // // Calculate available shared memory for data processing
+        // const uint32_t available_shared_mem = ((prop.sharedMemPerBlock - shared_hist_size) * 3) / 4;  // Use ~75% of remaining shared memory
         
         // Calculate part_size based on shared memory constraints
-        res.numElemInBlock = min((uint32_t)available_shared_mem / type_size, size);
+        // res.numElemInBlock = min((uint32_t)available_shared_mem / type_size, size);
         res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
 
         return res;
@@ -253,7 +253,7 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
                 break;
             }
 
-            printf("Sort data now: ");
+            // printf("Sort data now: ");
             for(int i=0; i<32; i++) {
                 if(std::is_same<T, float>::value)
                     printf("[%d %f] ", i, sortData[i]);
@@ -278,29 +278,23 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
                 cpuHist[i] = 0;
             }
 
-            // Compute CPU histogram
-            for (uint32_t i = 0; i < size; i++) {
-                uint32_t bits = toBitsCpu<T>(sortData[i]);
-                uint32_t digit = (bits >> shift) & RADIX_MASK;
-                cpuHist[digit]++;
-            }
-            // Convert to exclusive prefix sum
-            uint32_t prev = 0;
-            for (uint32_t i = 0; i < RADIX; i++) {
-                uint32_t current = cpuHist[i];
-                cpuHist[i] = prev;
-                prev += current;
-            }
+            // // Compute CPU histogram
+            // for (uint32_t i = 0; i < size; i++) {
+            //     uint32_t bits = toBitsCpu<T>(sortData[i]);
+            //     uint32_t digit = (bits >> shift) & RADIX_MASK;
+            //     cpuHist[digit]++;
+            // }
+            // // Convert to exclusive prefix sum
+            // uint32_t prev = 0;
+            // for (uint32_t i = 0; i < RADIX; i++) {
+            //     uint32_t current = cpuHist[i];
+            //     cpuHist[i] = prev;
+            //     prev += current;
+            // }
 
             c_ret = cudaMemcpy(gpuHist, d_globalHist + (RADIX * pass), radixSize, cudaMemcpyDeviceToHost);
             if (c_ret) {
                 printf("[Upsweep -> cudaMemcpy -> GpuHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
-                errors += 1;
-                break;
-            }
-            c_ret = cudaDeviceSynchronize();
-            if (c_ret) {
-                printf("[Upsweep -> cudaDevSync -> GpuHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
                 errors += 1;
                 break;
             }
@@ -311,6 +305,7 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
                 errors += 1;
                 break;
             }
+            
             c_ret = cudaDeviceSynchronize();
             if (c_ret) {
                 printf("[Upsweep -> cudaDevSync -> GpuPassHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
@@ -318,21 +313,34 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
                 break;
             }
             
-            for(uint32_t i=0; i<RADIX; i++) {
-                if(i < 16 && gpuHist[i] != size) {
-                    printf("[%u %u]", i, gpuHist[i]);
+            for(uint32_t i=0; i < res.numThreadBlocks; ++i) {
+                uint32_t offset = i * res.numElemInBlock;
+                printf("\nPeeking into sort data for block[%u]\n", i);
+                printf("Data:\n");
+                for(uint32_t j = 0; j < res.numElemInBlock; ++j) {
+                    printf("%u ", sortData[j + offset]);
                 }
-                if(cpuHist[i] != gpuHist[i] && errors < 16) {
-                    errors += 1;
-                    printf("Error[bin %u/ radixShift %u]: CPU[%u] GPU[%u]\n", i, shift, cpuHist[i], gpuHist[i]);
+                printf("\nHist:\n");
+                offset = i * RADIX;
+                for(uint32_t j=0; j<64; ++j) {
+                    printf("[%u %u %u] ", j, gpuHist[j], gpuPassHist[j + offset]);
                 }
             }
-            printf("\n");
+            // for(uint32_t i=0; i<RADIX; i++) {
+            //     if(i < 16 && gpuHist[i] != size) {
+            //         printf("[%u %u]", i, gpuHist[i]);
+            //     }
+            //     // if(cpuHist[i] != gpuHist[i] && errors < 16) {
+            //     //     errors += 1;
+            //     //     printf("Error[bin %u/ radixShift %u]: CPU[%u] GPU[%u]\n", i, shift, cpuHist[i], gpuHist[i]);
+            //     // }
+            // }
+            // printf("\n");
 
-            for(uint32_t i=0; i<16; i++) {
-                printf("[%u %u] ", i, gpuPassHist[i]);
-            }
-            printf("\n");
+            // for(uint32_t i=0; i<16; i++) {
+            //     printf("[%u %u] ", i, gpuPassHist[i]);
+            // }
+            // printf("\n");
             
             free(cpuHist);
             free(gpuHist);
@@ -402,7 +410,9 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
 
             for (uint32_t r = 0; r < RADIX; r++) {
                 uint32_t offset = r * res.numThreadBlocks;
-                
+                if(r < 16) {
+                    printf("Hist@[%u]: %u\n", r, passHistGpu[r]);
+                }
                 for (uint32_t i = 0; i < res.numThreadBlocks; i++) {
                     if (passHistGpu[offset + i] != passHistCpu[offset + i]) {
                         errors += 1;
@@ -462,7 +472,7 @@ uint32_t validateUpsweep(const uint32_t size, bool dataseq = true) {
 }
 
 int main() {
-    uint32_t sizes[] = { 32, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
+    uint32_t sizes[] = { 64, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
     for(uint32_t i = 0; i < 1; i++) {

@@ -317,9 +317,9 @@ __global__ void RadixScan(
     const uint32_t circularLaneShift = getLaneId() + 1 & LANE_MASK;
     const uint32_t partitionsEnd = threadBlocks / blockDim.x * blockDim.x;
     const uint32_t digitOffset = blockIdx.x * threadBlocks;
-    if(blockIdx.x < 2 && threadIdx.x < 2) {
-        printf("BlockId[%u] ThreadId[%u]: LaneId[%u] circularShift[%u] partitionEnd[%u] digitOffset[%u]\n", blockIdx.x, threadIdx.x, getLaneId(), circularLaneShift, partitionsEnd, digitOffset);
-    }
+    // if(blockIdx.x < 2 && threadIdx.x < 2) {
+    //     printf("BlockId[%u] ThreadId[%u]: LaneId[%u] circularShift[%u] partitionEnd[%u] digitOffset[%u]\n", blockIdx.x, threadIdx.x, getLaneId(), circularLaneShift, partitionsEnd, digitOffset);
+    // }
     uint32_t i = threadIdx.x;
     for (; i < partitionsEnd; i += blockDim.x)
     {
@@ -610,9 +610,15 @@ void radix() {
     // Create some data
     T *msort_H = (T*)malloc(sortsize);
     uint32_t *mayload_H = (uint32_t*)malloc(payloadsize);
+    uint32_t somearr[] = { 28, 10, 6, 13, 23, 4, 22, 6, 3, 1, 8, 7, 5, 25, 29, 4, 9, 21, 13, 22, 32, 8, 27, 0, 26, 17, 11, 10, 25, 10, 32, 18 };
     for(int i = 0; i < k_maxSize; i++) {
-        // msort_H[i] = static_cast<T>(randnum(0, k_maxSize));
-        msort_H[i] = static_cast<T>(i);
+        if(i < 32) {
+            msort_H[i] = somearr[i];
+        } else {
+            // msort_H[i] = static_cast<T>(randnum(33, k_maxSize));
+            msort_H[i] = static_cast<T>(255);
+        }
+        // msort_H[i] = static_cast<T>(i);
         mayload_H[i] = static_cast<uint32_t>(i);
     }
 
@@ -643,19 +649,23 @@ void radix() {
             // Copy old state
             uint32_t* passHistBefore = (uint32_t*)malloc(pass_hist_size);
             // 10 elements of pass hist
-            for(int i = 0; i < 10; i++) {
-                printf("PassHist@[%d]: passHistBefore[%u]\n", i, passHistBefore[i]);
-            }
+            printf("PassHist Before:\n");
             cudaMemcpy(passHistBefore, m_passHistogram, pass_hist_size, cudaMemcpyDeviceToHost);
             cudaDeviceSynchronize();
+            for(int i=0; i<32; i++) {
+                printf("[%d %u] ", i, passHistBefore[i]);
+            }
+            printf("\n");
+
             RadixScan <<<k_radix, k_scanThreads>>> (m_passHistogram, threadblocks);
-
-            // Copy new state
-            uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
-            // uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
-            cudaMemcpy(passHistGpu, m_passHistogram, pass_hist_size, cudaMemcpyDeviceToHost);
+            printf("PassHist After: ThreadBlocks[%u]\n", threadblocks);
+            cudaMemcpy(passHistBefore, m_passHistogram, pass_hist_size, cudaMemcpyDeviceToHost);
             cudaDeviceSynchronize();
-
+            for(int i=0; i<pass_hist_size; i++) {
+                if(passHistBefore[i] > 0)
+                    printf("[%d %u] ", i, passHistBefore[i]);
+            }
+            printf("\n");
             // for (uint32_t r = 0; r < RADIX; r++) {
             //     uint32_t offset = r * threadblocks;
                 
@@ -671,7 +681,7 @@ void radix() {
             // }
 
             free(passHistBefore);
-            free(passHistGpu);
+            // free(passHistGpu);
             // free(passHistCpu);
         }
         RadixDownsweepPairs<T> <<<threadblocks, k_downsweepThreads>>> (m_sort, m_sortPayload, m_alt, m_altPayload,

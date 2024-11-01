@@ -204,7 +204,7 @@ __global__ void RadixUpsweep(
 
     // Calculate number of full vectors - we are going to make an attempt to process 4 vectors at a time
     const uint32_t full_vecs = elements_in_block / vec_size;
-
+    
     for (uint32_t i = threadIdx.x; i < full_vecs; i += blockDim.x) {
         const uint32_t idx = block_start / vec_size + i;
         const VecT vec_val = reinterpret_cast<const VecT*>(sort)[idx];
@@ -215,7 +215,7 @@ __global__ void RadixUpsweep(
             atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
         }
     }
-
+    
     // Process remaining elements
     const uint32_t vec_end = block_start + (full_vecs * vec_size);
     for (uint32_t i = threadIdx.x + vec_end; i < block_end; i += blockDim.x) {
@@ -251,40 +251,29 @@ __global__ void RadixUpsweep(
 }
 
 
-// TODO: optimize this with shared memory
 __global__ void RadixScan(
     uint32_t* passHist,
     const uint32_t threadBlocks
 ) {
     __shared__ uint32_t s_scan[128];
 
-    uint32_t reduction = 0;
-    // Get ID of the next thread: 0 -> 1, 1 -> 2 ... 31 -> 0
-    const uint32_t circularLaneShift = getLaneId() + 1 & LANE_MASK;
+    // Get ID of the next thread: getLaneId(): 0 -> 1, 1 -> 2 ... 31 -> 0
+    // const uint32_t circularLaneShift = getLaneId() + 1 & LANE_MASK;
     // Each block is responsible for one digit - we are launching this with `RADIX` blocks
     const uint32_t digitOffset = blockIdx.x * threadBlocks;
     
     // Load this digit to shared memory
     // For `0`th digit we are getting `Block 0: 0`, `Block 1: 0` ...
-    // if(threadIdx.x < threadBlocks) {
-    //     if(threadIdx.x + digitOffset < 36) {
-    //         printf("Bf: [%u %u %u] ", threadIdx.x + digitOffset, passHist[threadIdx.x + digitOffset], s_scan[threadIdx.x + digitOffset]);
-    //     }
-    //     s_scan[threadIdx.x] = passHist[threadIdx.x + digitOffset];
-    //     if(threadIdx.x + digitOffset < 36) {
-    //         printf("Af: [%u %u] ", threadIdx.x + digitOffset, s_scan[threadIdx.x]);
-    //     }
-    // }
     s_scan[threadIdx.x] = (threadIdx.x < threadBlocks) ? passHist[threadIdx.x + digitOffset] : 0;
     s_scan[threadIdx.x] = InclusiveWarpScan(s_scan[threadIdx.x]);
     __syncthreads();
 
-    // if((blockIdx.x == 0) &&  threadIdx.x == 127) {
-    //     printf("Block[%u]\n", blockIdx.x);
-    //     for(uint32_t i=0; i<128; i++) {
-    //         printf("%u ", s_scan[i]);
-    //     }
-    // }
+    if((blockIdx.x == 4) &&  threadIdx.x == 127) {
+        printf("Block[%u]\n", blockIdx.x);
+        for(uint32_t i=0; i<128; i++) {
+            printf("%u ", s_scan[i]);
+        }
+    }
     // Now, for every warp of the block, update the last element in the block with a `inclusive prefix sum`
     // Only one thread per warp is acting on this
     if(threadIdx.x < blockDim.x >> LANE_LOG) {
@@ -292,47 +281,14 @@ __global__ void RadixScan(
         s_scan[warp_last_idx]  = ActiveInclusiveWarpScan(s_scan[warp_last_idx]); 
     }
     __syncthreads();
+    if((blockIdx.x == 4) &&  threadIdx.x == 127) {
+        printf("Block[%u] After:\n", blockIdx.x);
+        for(uint32_t i=0; i<128; i++) {
+            printf("%u ", s_scan[i]);
+        }
+    }
 
     
-    // // Current thread position within this warp
-    // const uint32_t lane_id = getLaneId();
-    // // In the `Upsweep` kernel we have computed `passHist` per threadBlock
-    // // So, the current digit to process is @ blockIdx * threadBlocks
-    // const uint32_t digit_offset = blockIdx.x * threadBlocks;
-    
-    // // Process in chunks of WARP_SIZE
-    // const uint32_t num_warps = (threadBlocks + WARP_SIZE - 1) / WARP_SIZE;
-    // uint32_t running_sum = 0;
-    
-    // // Process each warp-sized chunk
-    // for (uint32_t warp = 0; warp < num_warps; warp++) {
-    //     const uint32_t start_idx = warp * WARP_SIZE;
-    //     const uint32_t local_idx = start_idx + lane_id;
-        
-    //     // Load and scan within warp
-    //     uint32_t val = 0;
-    //     if (local_idx < threadBlocks) {
-    //         val = passHist[digit_offset + local_idx];
-    //     }
-        
-    //     // Perform inclusive scan within warp
-    //     val = InclusiveWarpScan(val);
-        
-    //     // Add running sum from previous iterations
-    //     val += running_sum;
-        
-    //     // Store result if within bounds
-    //     if (local_idx < threadBlocks) {
-    //         passHist[digit_offset + local_idx] = val;
-    //     }
-        
-    //     // Update running sum for next iteration
-    //     // Get the last valid value in this warp
-    //     uint32_t warp_last = __shfl_sync(0xffffffff, val, min(threadBlocks - start_idx, WARP_SIZE) - 1);
-    //     if (lane_id == 0) {
-    //         running_sum = warp_last;
-    //     }
-    // }
 }
 
 template<typename T>
