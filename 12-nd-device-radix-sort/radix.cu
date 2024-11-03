@@ -132,14 +132,6 @@ struct VectorTrait<uint8_t> {
     static constexpr uint32_t vector_size = 16;  // 16 * 1 byte = 16 bytes
 };
 
-// Vector type definitions
-template<typename T>
-struct alignas(16) Vector {  // Align to 16 bytes for optimal memory access
-    T data[VectorTrait<T>::vector_size];
-    
-    __device__ __host__ T& operator[](int i) { return data[i]; }
-    __device__ __host__ const T& operator[](int i) const { return data[i]; }
-};
 
 // Helper function to get type-specific maximum value
 template<typename T>
@@ -180,8 +172,9 @@ __global__ void RadixUpsweep(
     uint32_t* passHist,
     const uint32_t size,
     const uint32_t radixShift,
-    const uint32_t numElemsInBlock // max number of elements being processed by this block
+    const uint32_t maxElemInBlock // max number of elements being processed by this block
 ) {
+    uint32_t printBlock = 0;
     // Shared memory for histogram - two sections to avoid bank conflicts
     constexpr uint32_t sharedSize = RADIX * 2;
     __shared__ uint32_t s_globalHist[sharedSize];
@@ -193,34 +186,49 @@ __global__ void RadixUpsweep(
     __syncthreads();
 
     // Calculate this block's range
-    const uint32_t block_start = blockIdx.x * numElemsInBlock;
-    const uint32_t block_end = min(block_start + numElemsInBlock, size);
+    const uint32_t block_start = blockIdx.x * maxElemInBlock;
+    const uint32_t block_end = min(block_start + maxElemInBlock, size);
     const uint32_t elements_in_block = block_end - block_start;
 
+    // if(blockIdx.x == printBlock && (threadIdx.x == 0 || threadIdx.x == 15)) {
+    //     printf("Thread[%u]: maxElemInBlock[%u] block_start[%u] block_end[%u] elements_in_block[%u]\n", threadIdx.x, maxElemInBlock, block_start, block_end, elements_in_block);
+    // }
+
+    // if(threadIdx.x == 0 && blockIdx.x == printBlock) {
+    //     // printf("\nBlock[%u]: ", blockIdx.x);
+    //     for(uint32_t i=block_start; i<block_end; ++i) {
+    //         printf("%u ", sort[i]);
+    //     }
+    //     printf("--\n");
+    // }
     // Vector load based on types
-    // constexpr uint32_t typesize = sizeof(T);
-    using VecT = Vector<T>;
     constexpr uint32_t vec_size = VectorTrait<T>::vector_size;
 
-    // Calculate number of full vectors - we are going to make an attempt to process 4 vectors at a time
+    // Calculate number of full vectors - we are going to make an attempt to process
     const uint32_t full_vecs = elements_in_block / vec_size;
+    const uint32_t vec_end = block_start + (full_vecs * vec_size);
     
     for (uint32_t i = threadIdx.x; i < full_vecs; i += blockDim.x) {
-        const uint32_t idx = block_start / vec_size + i;
-        const VecT vec_val = reinterpret_cast<const VecT*>(sort)[idx];
+        const uint32_t idx = block_start + i * vec_size;
         
-        #pragma unroll
-        for (int j = 0; j < vec_size; j++) {
-            uint32_t bits = toBits(vec_val[j]);
-            atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
+        if(idx < vec_end) {
+            // if(blockIdx.x == printBlock) {
+            //     printf("Idx[%u] ", idx);
+            // }
+            #pragma unroll
+            for (int j = 0; j < vec_size; ++j) {
+                uint32_t bits = toBits(sort[idx + j]);
+                // if(blockIdx.x == printBlock) {
+                //     printf("sort[%u %u]: [%u %u %u] ", idx, idx + j, sort[idx + j], bits, bits >> radixShift & RADIX_MASK);
+                // }
+                atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
+            }
         }
     }
     
     // Process remaining elements
-    const uint32_t vec_end = block_start + (full_vecs * vec_size);
     for (uint32_t i = threadIdx.x + vec_end; i < block_end; i += blockDim.x) {
-        const T t = sort[i];
-        uint32_t bits = toBits(t);
+        uint32_t bits = toBits(sort[i]);
         atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
     }
 
@@ -228,17 +236,33 @@ __global__ void RadixUpsweep(
 
     // Reduce histograms and prepare for prefix sum
     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x) {
+        // Merge possible bank conflicts
         s_globalHist[i] += s_globalHist[i + RADIX];
-        passHist[i * gridDim.x + blockIdx.x] = s_globalHist[i];
+        // Here we are expecting i-th digit of n-th radix block to have the frequency for the block
+        passHist[blockIdx.x * RADIX + i] = s_globalHist[i];
         s_globalHist[i] = InclusiveWarpScanCircularShift(s_globalHist[i]);
-    }   
+    }
     __syncthreads();
+    // if(threadIdx.x == 15 && blockIdx.x == printBlock) {
+    //     printf("\nBlockHist[%u]: ", blockIdx.x);
+    //     for(uint32_t i=0; i<RADIX; ++i) {
+    //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
+    //     }
+    //     printf("--\n");
+    // }
 
-    // Perform warp-level scan
+    // Perform warp-level scan - for first thread in each warp
     if (threadIdx.x < (RADIX >> LANE_LOG))
         s_globalHist[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHist[threadIdx.x << LANE_LOG]);
     __syncthreads();
 
+    // if(threadIdx.x == 15 && blockIdx.x == printBlock) {
+    //     printf("\nBlockHist[%u]: ", blockIdx.x);
+    //     for(uint32_t i=0; i<RADIX; ++i) {
+    //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
+    //     }
+    //     printf("--\n");
+    // }
     // Update global histogram with prefix sum results
     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x) {
         atomicAdd(
@@ -248,6 +272,14 @@ __global__ void RadixUpsweep(
                 __shfl_sync(0xfffffffe, s_globalHist[i - 1], 1) : 0)
         );
     }
+
+    // if(threadIdx.x == 15 && blockIdx.x == printBlock) {
+    //     printf("\nBlockHist[%u]: ", blockIdx.x);
+    //     for(uint32_t i=0; i<RADIX; ++i) {
+    //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
+    //     }
+    //     printf("--\n");
+    // }
 }
 
 
@@ -260,15 +292,19 @@ __global__ void RadixScan(
     // Get ID of the next thread: getLaneId(): 0 -> 1, 1 -> 2 ... 31 -> 0
     // const uint32_t circularLaneShift = getLaneId() + 1 & LANE_MASK;
     // Each block is responsible for one digit - we are launching this with `RADIX` blocks
-    const uint32_t digitOffset = blockIdx.x * threadBlocks;
+    // const uint32_t digitOffset = threadIdx.x * ;
     
     // Load this digit to shared memory
     // For `0`th digit we are getting `Block 0: 0`, `Block 1: 0` ...
-    s_scan[threadIdx.x] = (threadIdx.x < threadBlocks) ? passHist[threadIdx.x + digitOffset] : 0;
-    s_scan[threadIdx.x] = InclusiveWarpScan(s_scan[threadIdx.x]);
+    s_scan[threadIdx.x] = (threadIdx.x < threadBlocks) ? passHist[threadIdx.x * RADIX + blockIdx.x] : 0;
     __syncthreads();
 
-    if((blockIdx.x == 4) &&  threadIdx.x == 127) {
+    // if(threadIdx.x < threadBlocks) {
+    s_scan[threadIdx.x] = InclusiveWarpScan(s_scan[threadIdx.x]);
+    __syncthreads();
+    // }
+
+    if((blockIdx.x == 1) &&  threadIdx.x == blockDim.x - 1) {
         printf("Block[%u]\n", blockIdx.x);
         for(uint32_t i=0; i<128; i++) {
             printf("%u ", s_scan[i]);
@@ -276,17 +312,17 @@ __global__ void RadixScan(
     }
     // Now, for every warp of the block, update the last element in the block with a `inclusive prefix sum`
     // Only one thread per warp is acting on this
-    if(threadIdx.x < blockDim.x >> LANE_LOG) {
-        uint32_t warp_last_idx = (threadIdx.x + 1 << LANE_LOG) - 1;
-        s_scan[warp_last_idx]  = ActiveInclusiveWarpScan(s_scan[warp_last_idx]); 
-    }
-    __syncthreads();
-    if((blockIdx.x == 4) &&  threadIdx.x == 127) {
-        printf("Block[%u] After:\n", blockIdx.x);
-        for(uint32_t i=0; i<128; i++) {
-            printf("%u ", s_scan[i]);
-        }
-    }
+    // if(threadIdx.x < blockDim.x >> LANE_LOG) {
+    //     uint32_t warp_last_idx = (threadIdx.x + 1 << LANE_LOG) - 1;
+    //     s_scan[warp_last_idx]  = ActiveInclusiveWarpScan(s_scan[warp_last_idx]); 
+    // }
+    // __syncthreads();
+    // if((blockIdx.x == 4) &&  threadIdx.x == 127) {
+    //     printf("Block[%u] After:\n", blockIdx.x);
+    //     for(uint32_t i=0; i<128; i++) {
+    //         printf("%u ", s_scan[i]);
+    //     }
+    // }
 
     
 }
