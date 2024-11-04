@@ -238,8 +238,9 @@ __global__ void RadixUpsweep(
     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x) {
         // Merge possible bank conflicts
         s_globalHist[i] += s_globalHist[i + RADIX];
-        // Here we are expecting i-th digit of n-th radix block to have the frequency for the block
-        passHist[blockIdx.x * RADIX + i] = s_globalHist[i];
+        // Memory layout: digit frequencies across all blocks
+        // So, if we have n blocks we'll have frequency values for a digit in each blocks consecutively
+        passHist[i * gridDim.x + blockIdx.x] = s_globalHist[i];
         s_globalHist[i] = InclusiveWarpScanCircularShift(s_globalHist[i]);
     }
     __syncthreads();
@@ -285,46 +286,89 @@ __global__ void RadixUpsweep(
 
 __global__ void RadixScan(
     uint32_t* passHist,
-    const uint32_t threadBlocks
+    const uint32_t numBlocks
 ) {
+    const uint32_t blockSize = blockDim.x;
+
     __shared__ uint32_t s_scan[128];
 
+    const uint32_t tid = threadIdx.x;
+    const uint32_t laneId = getLaneId();
+    // Circular shift within warp - this helps reduce bank conflicts
     // Get ID of the next thread: getLaneId(): 0 -> 1, 1 -> 2 ... 31 -> 0
-    // const uint32_t circularLaneShift = getLaneId() + 1 & LANE_MASK;
-    // Each block is responsible for one digit - we are launching this with `RADIX` blocks
-    // const uint32_t digitOffset = threadIdx.x * ;
+    const uint32_t circularLaneShift = (laneId + 1) & LANE_MASK;
+
+    // Number of elements before this digit??
+    const uint32_t digitOffset = blockIdx.x * numBlocks;
+
+    // Calculate the number of full block-sized chunks we need to process
+    const uint32_t fullBlocksEnd = (numBlocks / blockSize) * blockSize;
     
-    // Load this digit to shared memory
-    // For `0`th digit we are getting `Block 0: 0`, `Block 1: 0` ...
-    s_scan[threadIdx.x] = (threadIdx.x < threadBlocks) ? passHist[threadIdx.x * RADIX + blockIdx.x] : 0;
-    __syncthreads();
+    // Running sum for carrying over between iterations
+    uint32_t reduction = 0;
 
-    // if(threadIdx.x < threadBlocks) {
-    s_scan[threadIdx.x] = InclusiveWarpScan(s_scan[threadIdx.x]);
-    __syncthreads();
-    // }
+    // Process full blocks
+    for (uint32_t blockStart = 0; blockStart < fullBlocksEnd; blockStart += blockSize) {
+        // Load data into shared memory with circular shift pattern
+        const uint32_t globalIdx = blockStart + tid;
+        s_scan[tid] = passHist[globalIdx + digitOffset];
+        __syncthreads();
 
-    if((blockIdx.x == 1) &&  threadIdx.x == blockDim.x - 1) {
-        printf("Block[%u]\n", blockIdx.x);
-        for(uint32_t i=0; i<128; i++) {
-            printf("%u ", s_scan[i]);
+        // Step 1: Perform warp-level scan
+        s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
+        __syncthreads();
+
+        // Step 2: Collect and scan warp totals
+        if (tid < (blockDim.x >> LANE_LOG)) {
+            s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
         }
-    }
-    // Now, for every warp of the block, update the last element in the block with a `inclusive prefix sum`
-    // Only one thread per warp is acting on this
-    // if(threadIdx.x < blockDim.x >> LANE_LOG) {
-    //     uint32_t warp_last_idx = (threadIdx.x + 1 << LANE_LOG) - 1;
-    //     s_scan[warp_last_idx]  = ActiveInclusiveWarpScan(s_scan[warp_last_idx]); 
-    // }
-    // __syncthreads();
-    // if((blockIdx.x == 4) &&  threadIdx.x == 127) {
-    //     printf("Block[%u] After:\n", blockIdx.x);
-    //     for(uint32_t i=0; i<128; i++) {
-    //         printf("%u ", s_scan[i]);
-    //     }
-    // }
+        __syncthreads();
 
-    
+        const uint32_t outputIdx = circularLaneShift + (globalIdx & ~LANE_MASK);
+        if (outputIdx < numBlocks) {
+            passHist[outputIdx + digitOffset] =
+                (laneId != LANE_MASK ? s_scan[tid] : 0) +
+                (tid >= WARP_SIZE ? 
+                    __shfl_sync(0xffffffff, s_scan[tid - 1], 0) : 0) +
+                reduction;
+        }
+
+        reduction += s_scan[blockSize - 1];
+        __syncthreads();
+    }
+
+    // Remaining elements handled similarly...
+    // const uint32_t remainingStart = fullBlocksEnd;
+    if(tid < numBlocks && blockIdx.x <= 4) {
+        printf("Full block[%u] DigitOffset[%u] Thread[%u]: %u %u\n", blockIdx.x, digitOffset, tid, fullBlocksEnd + tid + digitOffset, passHist[fullBlocksEnd + tid + digitOffset]);
+    }
+    if (fullBlocksEnd + tid < numBlocks) {
+        // Load remaining data with circular shift pattern
+        s_scan[tid] = passHist[fullBlocksEnd + tid + digitOffset];    
+        // s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
+        __syncthreads();
+
+        if(blockIdx.x == 4 && tid == numBlocks - 1) {
+            for(uint32_t i=0; i<blockDim.x; ++i) {
+                printf("%u ", s_scan[i]);
+            }
+            printf("\n");
+        }   
+        // if (tid < blockDim.x / WARP_SIZE) {
+        //     s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
+        // }
+        // __syncthreads();
+
+        // const uint32_t outputIdx = circularLaneShift + (fullBlocksEnd & ~LANE_MASK);
+        
+        // if (outputIdx < numBlocks) {
+        //     passHist[outputIdx + digitOffset] =
+        //         (laneId != LANE_MASK ? s_scan[tid] : 0) +
+        //         (tid >= WARP_SIZE ? 
+        //             s_scan[(tid & ~LANE_MASK) - 1] : 0) +
+        //         reduction;
+        // }
+    }
 }
 
 template<typename T>

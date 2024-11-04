@@ -278,9 +278,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             // Initialize all zeroes
             for(int i=0; i<RADIX; ++i) {
                 cpuGlobHist[i] = 0;
-            }
-            for(int i=0; i<RADIX * res.numThreadBlocks; ++i) {
-                cpuPassHist[i] = 0;
+                for(int j=0; j<res.numThreadBlocks; ++j) {
+                    cpuPassHist[i * j] = 0;
+                }
             }
 
             // Compute CPU histogram
@@ -381,7 +381,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 break;
             }
 
-            RadixScan<<<RADIX, res.numScanThreads>>>(d_passHist, res.numThreadBlocks);
+            RadixScan<<<RADIX, 128>>>(d_passHist, res.numThreadBlocks);
             c_ret = cudaGetLastError();
             if (c_ret) {
                 printf("[Scan] Cuda Error: %s", cudaGetErrorString(c_ret));
@@ -400,54 +400,71 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             }
             printf("\n");
         //     // Copy new state
-        //     uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
-        //     uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
+            uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
+            uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
 
-        //     c_ret = cudaMemcpy(passHistGpu, d_passHist, pass_hist_size, cudaMemcpyDeviceToHost);
-        //     if (c_ret) {
-        //         printf("[Scan -> memCpy -> d_passHist] Cuda Error: %s", cudaGetErrorString(c_ret));
-        //         errors += 1;
-        //         break;
-        //     }
-        //     c_ret = cudaDeviceSynchronize();
-        //     if (c_ret) {
-        //         printf("[Scan -> cudaDevSync -> d_passHist] Cuda Error: %s", cudaGetErrorString(c_ret));
-        //         errors += 1;
-        //         break;
-        //     }
+            c_ret = cudaMemcpy(passHistGpu, d_passHist, pass_hist_size, cudaMemcpyDeviceToHost);
+            if (c_ret) {
+                printf("[Scan -> memCpy -> d_passHist] Cuda Error: %s", cudaGetErrorString(c_ret));
+                errors += 1;
+                break;
+            }
+            c_ret = cudaDeviceSynchronize();
+            if (c_ret) {
+                printf("[Scan -> cudaDevSync -> d_passHist] Cuda Error: %s", cudaGetErrorString(c_ret));
+                errors += 1;
+                break;
+            }
 
-        //     // Create cpu alternate values
-        //     // Process each partition separately
-        //     for (uint32_t r = 0; r < RADIX; r++) {
-        //         uint32_t offset = r * res.numThreadBlocks;
+            // Create cpu alternate values
+            // Process each partition separately
+            passHistCpu[0] = 0;
+            // For each block
+            for(int block = 0; block < res.numThreadBlocks; block++) {
+                // For each digit
+                for(int digit = 0; digit < RADIX; digit++) {
+                    int sum = 0;
+                    
+                    uint32_t trg = block * RADIX + digit;
+                    // Sum of all previous digits from previous blocks
+                    for(int prevDigit = 0; prevDigit <= digit; prevDigit++) {
+                        for(int b = 0; b <= block; b++) {
+                            uint32_t src = b * RADIX + prevDigit;
+
+                            if(src != trg)
+                                sum += passHistBefore[src];
+                        }
+                    }
+                    
+                    passHistCpu[trg] = sum;
+                }
+            }
+
+            for (uint32_t digit = 0; digit < RADIX; ++digit) {
+                for(uint32_t block=0; block < res.numThreadBlocks; ++block) {
+                    uint32_t trgt = block * RADIX + digit;
+                    // if(digit < 6)
+                    //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
+                    if(passHistCpu[trgt] != passHistGpu[trgt]) {
+                        errors += 1;
+
+                        if(errors < 10)
+                            printf("Mismatch at digit %u, block %u: GPU = %u, CPU = %u\n", digit, block, passHistGpu[trgt], passHistCpu[trgt]);
+                    }
+                }
+                // uint32_t offset = r * res.numThreadBlocks;
                 
-        //         // First element remains the same
-        //         passHistCpu[offset] = passHistBefore[offset];
+                // for (uint32_t i = 0; i < res.numThreadBlocks; i++) {
+                //     if (passHistGpu[offset + i] != passHistCpu[offset + i]) {
+                //         
                 
-        //         // Simple inclusive scan for this partition
-        //         for (uint32_t i = 1; i < res.numThreadBlocks; i++) {
-        //             passHistCpu[offset + i] = passHistCpu[offset + i - 1] + 
-        //                                     passHistBefore[offset + i];
-        //         }
-        //     }
+                //     }
+                // }
+            }
 
-        //     for (uint32_t r = 0; r < RADIX; r++) {
-        //         uint32_t offset = r * res.numThreadBlocks;
-        //         if(r < 16) {
-        //             printf("Hist@[%u]: %u\n", r, passHistGpu[r]);
-        //         }
-        //         for (uint32_t i = 0; i < res.numThreadBlocks; i++) {
-        //             if (passHistGpu[offset + i] != passHistCpu[offset + i]) {
-        //                 errors += 1;
-        //                 if(errors < 10)
-        //                     printf("Mismatch at partition %u, index %u: GPU = %u, CPU = %u\n", r, i, passHistGpu[offset + i], passHistCpu[offset + i]);
-        //             }
-        //         }
-        //     }
-
-        //     free(passHistBefore);
-        //     free(passHistGpu);
-        //     free(passHistCpu);
+            free(passHistBefore);
+            free(passHistGpu);
+            free(passHistCpu);
         }
 
         // Finally launch the Downsweep kernel
@@ -495,9 +512,11 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
 }
 
 int main() {
-    uint32_t sizes[] = { 67, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
+    const uint32_t N = 13;
+    uint32_t sizes[N] = { 67, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
+    // for(uint32_t i = 0; i < N; i++) {
     for(uint32_t i = 0; i < 1; i++) {
         // {
         //     printf("`uint32_t`: Upsweep Validation (sequential)\n");
