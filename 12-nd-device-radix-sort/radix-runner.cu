@@ -144,10 +144,11 @@ inline uint32_t toBitsCpu(T val) {
 struct Resources {
     // uint32_t numVecElemInBlock; // Vector elements per block
     uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
+    uint32_t numScanThreads; // number of scan threads to launch should be multiples of 32 (WARP_SIZE) but based on number of blocks
 
-    uint32_t const numElemInBlock      = 64; // Elements per block
-    uint32_t const numUpsweepThreads   = 32; // Num threads per upsweep kernel
-    uint32_t const numScanThreads      = 16; // Num of threads for scan
+    uint32_t const numElemInBlock      = 512; // Elements per block
+    uint32_t const numUpsweepThreads   = 512; // Num threads per upsweep kernel
+    // uint32_t const numScanThreads   = 16; // Num of threads for scan
     uint32_t const numDownsweepThreads = 64; // number of downsweep threads
     uint32_t const radix = RADIX;
 
@@ -168,6 +169,7 @@ struct Resources {
         // Calculate part_size based on shared memory constraints
         // res.numElemInBlock = min((uint32_t)available_shared_mem / type_size, size);
         res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
+        res.numScanThreads  = (res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
 
         return res;
     }
@@ -384,8 +386,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 errors += 1;
                 break;
             }
-
-            RadixScan<<<RADIX, 128>>>(d_passHist, res.numThreadBlocks);
+        
+            RadixScan<<<RADIX, res.numScanThreads, res.numScanThreads * sizeof(uint32_t)>>>(d_passHist, res.numThreadBlocks);
             c_ret = cudaGetLastError();
             if (c_ret) {
                 printf("[Scan] Cuda Error: %s", cudaGetErrorString(c_ret));
@@ -396,7 +398,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             // printf("\nPeeking 32 digits in passHist: \n");
             // for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
                 
-            // //     uint32_t offset = RADIX * blk;
+            // // //     uint32_t offset = RADIX * blk;
             //     printf("Block %u:\n", blk);
             //     for(uint32_t d=0; d<32; ++d) {
             //         uint32_t trg = d * res.numThreadBlocks + blk;
@@ -404,7 +406,6 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             //     }
             //     printf("\n");
             // }
-            // printf("\n");
 
             uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
             uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
@@ -431,11 +432,13 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
 
                 for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
                     uint32_t trgt = blk + offst;
-                    sum += passHistBefore[trgt];
                     passHistCpu[trgt] = sum;
+                    sum += passHistBefore[trgt];
                 }
             }
-
+            
+            printf("Validating `passHist` after scan\n");
+            bool passHistError = false;
             for (uint32_t digit = 0; digit < RADIX; ++digit) {
                 uint32_t offset = digit * res.numThreadBlocks;
                 for(uint32_t block=0; block < res.numThreadBlocks; ++block) {
@@ -444,20 +447,20 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                     //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
                     if(passHistCpu[trgt] != passHistGpu[trgt]) {
                         errors += 1;
-
-                        if(errors < 16)
+                        passHistError = true;
+                        if(errors < 8) {
                             printf("Mismatch at digit %u, block %u: GPU = %u, CPU = %u\n", digit, block, passHistGpu[trgt], passHistCpu[trgt]);
+                            printf("Peeking digit %u in passHist: \n", digit);
+                            for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
+                                uint32_t trg = digit * res.numThreadBlocks + blk;
+                                printf("[%u %u] ", blk, passHistBefore[trg]);
+                            }
+                            printf("\n");
+                        }
                     }
                 }
-                // uint32_t offset = r * res.numThreadBlocks;
-                
-                // for (uint32_t i = 0; i < res.numThreadBlocks; i++) {
-                //     if (passHistGpu[offset + i] != passHistCpu[offset + i]) {
-                //         
-                
-                //     }
-                // }
             }
+            printf("Pass hist validation after `Scan`: %s\n", passHistError ? "FAIL" : "PASS");
 
             free(passHistBefore);
             free(passHistGpu);
@@ -513,8 +516,8 @@ int main() {
     uint32_t sizes[N] = { 67, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    // for(uint32_t i = 0; i < N; i++) {
-    for(uint32_t i = 0; i < 1; i++) {
+    for(uint32_t i = 0; i < N; i++) {
+    // for(uint32_t i = 0; i < 8; i++) {
         // {
         //     printf("`uint32_t`: Upsweep Validation (sequential)\n");
         //     uint32_t errors = validate<uint32_t>(sizes[i]);

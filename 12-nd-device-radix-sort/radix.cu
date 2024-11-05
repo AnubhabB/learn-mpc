@@ -292,7 +292,7 @@ __global__ void RadixScan(
     const uint32_t tid = threadIdx.x;
     const uint32_t laneId = getLaneId();
 
-    __shared__ uint32_t s_scan[128];
+    extern __shared__ uint32_t s_scan[];
 
     // Initialize the shared memory!
     s_scan[tid] = 0;
@@ -302,10 +302,6 @@ __global__ void RadixScan(
     // Circular shift within warp - this helps reduce bank conflicts
     // Get ID of the next thread: getLaneId(): 0 -> 1, 1 -> 2 ... 31 -> 0
     const uint32_t circularLaneShift = (laneId + 1) & LANE_MASK;
-    
-    if(threadIdx.x == 24 && blockIdx.x == 4) {
-        printf("Lane: %u %u\n", circularLaneShift, laneId);
-    }
 
     // Where does the digit start
     const uint32_t digitOffset = blockIdx.x * numBlocks;
@@ -316,34 +312,6 @@ __global__ void RadixScan(
     // Running sum for carrying over between iterations
     uint32_t reduction = 0;
 
-    // Process full blocks
-    // for (uint32_t blockStart = 0; blockStart < fullBlocksEnd; blockStart += blockSize) {
-    //     // Load data into shared memory with circular shift pattern
-    //     const uint32_t globalIdx = blockStart + tid;
-    //     s_scan[tid] = passHist[globalIdx + digitOffset];
-
-    //     // Step 1: Perform warp-level scan
-    //     s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
-    //     __syncthreads();
-
-    //     // Step 2: Collect and scan warp totals
-    //     if (tid < (blockDim.x >> LANE_LOG)) {
-    //         s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
-    //     }
-    //     __syncthreads();
-
-    //     const uint32_t writeIdx = circularLaneShift + (blockStart & ~LANE_MASK);
-    //     if (writeIdx < numBlocks) {
-    //         passHist[writeIdx + digitOffset] =
-    //             (laneId != LANE_MASK ? s_scan[tid] : 0) +
-    //             (tid >= WARP_SIZE ? 
-    //                 __shfl_sync(0xffffffff, s_scan[tid - 1], 0) : 0) +
-    //             reduction;
-    //     }
-
-    //     reduction += s_scan[blockSize - 1];
-    //     __syncthreads();
-    // }
     uint32_t tidx = tid;
     for(; tidx<fullBlocksEnd; tidx += blockDim.x) {
         s_scan[tid] = passHist[tid + digitOffset];
@@ -372,8 +340,6 @@ __global__ void RadixScan(
 
     // Remaining elements handled similarly...
     uint32_t remainingElements = numBlocks - fullBlocksEnd;
-    // reduction += s_scan[remainingElements - 1];
-
     if(tidx < numBlocks) {
         s_scan[tid] = passHist[tid + digitOffset];
     }
@@ -395,35 +361,13 @@ __global__ void RadixScan(
             reduction;
     }
 
-    // if (fullBlocksEnd + tid < numBlocks) {
-    //     // Load remaining data with circular shift pattern
-    //     s_scan[tid] = passHist[fullBlocksEnd + tid + digitOffset];    
-    //     s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
-    //     __syncthreads();
-   
-    //     if (tid < blockDim.x / WARP_SIZE) {
-    //         s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
+    // if(blockIdx.x == 30 && tid == numBlocks - 1) {
+    //     printf("\nDigit[%u]\n", blockIdx.x);
+    //     for(uint32_t i=0; i<blockDim.x; ++i) {
+    //         printf("[%u %u] ", s_scan[i], i < numBlocks ? passHist[digitOffset + i] : 0);
     //     }
-    //     __syncthreads();
-
-    //     // const uint32_t outputIdx = tid + (fullBlocksEnd & ~LANE_MASK);
-    //     const uint32_t writeIdx = circularLaneShift + (fullBlocksEnd & ~LANE_MASK);
-    //     if (writeIdx < numBlocks) {
-    //         passHist[writeIdx + digitOffset] =
-    //             (laneId != LANE_MASK ? s_scan[tid] : 0) +
-    //             (tid >= WARP_SIZE ? 
-    //                 s_scan[(tid & ~LANE_MASK) - 1] : 0) +
-    //             reduction;
-    //     }
+    //     printf("\n");
     // }
-    // __syncthreads();
-    if(blockIdx.x == 1 && tid == numBlocks - 1) {
-        printf("\nDigit[%u]\n", blockIdx.x);
-        for(uint32_t i=0; i<blockDim.x; ++i) {
-            printf("[%u %u] ", s_scan[i], i < numBlocks ? passHist[digitOffset + i] : 0);
-        }
-        printf("\n");
-    }
 }
 
 template<typename T>
