@@ -278,8 +278,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             // Initialize all zeroes
             for(int i=0; i<RADIX; ++i) {
                 cpuGlobHist[i] = 0;
+                uint32_t offset = i * res.numThreadBlocks;
                 for(int j=0; j<res.numThreadBlocks; ++j) {
-                    cpuPassHist[i * j] = 0;
+                    cpuPassHist[offset + j] = 0;
                 }
             }
 
@@ -296,13 +297,15 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 cpuGlobHist[i] = prev;
                 prev += current;
             }
+            // Crea
             for(uint32_t i = 0; i<res.numThreadBlocks; ++i) {
                 uint32_t blockstart = i * res.numElemInBlock;
                 uint32_t blockend   = min(blockstart + res.numElemInBlock, size);
 
                 for(uint32_t j=blockstart; j < blockend; ++j) {
                     uint32_t bits = toBitsCpu<T>(sortData[j]);
-                    uint32_t trgt = i * RADIX + ((bits >> shift) & RADIX_MASK);
+                    bits = ((bits >> shift) & RADIX_MASK);
+                    uint32_t trgt = bits * res.numThreadBlocks + i;
                     cpuPassHist[trgt] += 1;
                 }
             }
@@ -338,7 +341,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                     if(cpuPassHist[v_idx] != gpuPassHist[v_idx]) {
                         errors++;
                         passHistError = true;
-                        printf("Error @ Block[%u] Digit[%u]: Cpu[%u] Gpu[%u]\n", block, digit, cpuPassHist[v_idx], gpuPassHist[v_idx]);
+                        if(errors < 10)
+                            printf("Error @ Block[%u] Digit[%u]: Cpu[%u] Gpu[%u]\n", block, digit, cpuPassHist[v_idx], gpuPassHist[v_idx]);
                     }
                 }
             }
@@ -389,17 +393,19 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 break;
             }
 
-            printf("\nPeeking 16 digits in passHist: \n");
-            for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
-                uint32_t offset = RADIX * blk;
-                printf("Block %u:\n", blk);
-                for(uint32_t d=0; d<16; ++d) {
-                    printf("[%u %u] ", d, passHistBefore[offset + d]);
-                }
-                printf("\n");
-            }
-            printf("\n");
-        //     // Copy new state
+            // printf("\nPeeking 32 digits in passHist: \n");
+            // for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
+                
+            // //     uint32_t offset = RADIX * blk;
+            //     printf("Block %u:\n", blk);
+            //     for(uint32_t d=0; d<32; ++d) {
+            //         uint32_t trg = d * res.numThreadBlocks + blk;
+            //         printf("[%u %u] ", d, passHistBefore[trg]);
+            //     }
+            //     printf("\n");
+            // }
+            // printf("\n");
+
             uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
             uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
 
@@ -418,37 +424,28 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
 
             // Create cpu alternate values
             // Process each partition separately
-            passHistCpu[0] = 0;
-            // For each block
-            for(int block = 0; block < res.numThreadBlocks; block++) {
-                // For each digit
-                for(int digit = 0; digit < RADIX; digit++) {
-                    int sum = 0;
-                    
-                    uint32_t trg = block * RADIX + digit;
-                    // Sum of all previous digits from previous blocks
-                    for(int prevDigit = 0; prevDigit <= digit; prevDigit++) {
-                        for(int b = 0; b <= block; b++) {
-                            uint32_t src = b * RADIX + prevDigit;
+            // For each digit
+            for(uint32_t dgt=0; dgt<RADIX; ++dgt) {
+                uint32_t sum = 0;
+                uint32_t offst = dgt * res.numThreadBlocks;
 
-                            if(src != trg)
-                                sum += passHistBefore[src];
-                        }
-                    }
-                    
-                    passHistCpu[trg] = sum;
+                for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
+                    uint32_t trgt = blk + offst;
+                    sum += passHistBefore[trgt];
+                    passHistCpu[trgt] = sum;
                 }
             }
 
             for (uint32_t digit = 0; digit < RADIX; ++digit) {
+                uint32_t offset = digit * res.numThreadBlocks;
                 for(uint32_t block=0; block < res.numThreadBlocks; ++block) {
-                    uint32_t trgt = block * RADIX + digit;
+                    uint32_t trgt = offset + block;
                     // if(digit < 6)
                     //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
                     if(passHistCpu[trgt] != passHistGpu[trgt]) {
                         errors += 1;
 
-                        if(errors < 10)
+                        if(errors < 16)
                             printf("Mismatch at digit %u, block %u: GPU = %u, CPU = %u\n", digit, block, passHistGpu[trgt], passHistCpu[trgt]);
                     }
                 }
@@ -516,8 +513,8 @@ int main() {
     uint32_t sizes[N] = { 67, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    // for(uint32_t i = 0; i < N; i++) {
-    for(uint32_t i = 0; i < 1; i++) {
+    for(uint32_t i = 0; i < N; i++) {
+    // for(uint32_t i = 1; i < 2; i++) {
         // {
         //     printf("`uint32_t`: Upsweep Validation (sequential)\n");
         //     uint32_t errors = validate<uint32_t>(sizes[i]);

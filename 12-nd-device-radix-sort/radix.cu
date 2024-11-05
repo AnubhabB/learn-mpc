@@ -289,16 +289,21 @@ __global__ void RadixScan(
     const uint32_t numBlocks
 ) {
     const uint32_t blockSize = blockDim.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t laneId = getLaneId();
 
     __shared__ uint32_t s_scan[128];
 
-    const uint32_t tid = threadIdx.x;
-    const uint32_t laneId = getLaneId();
+    // Initialize the shared memory!
+    s_scan[tid] = 0;
+    __syncthreads();
+
+    
     // Circular shift within warp - this helps reduce bank conflicts
     // Get ID of the next thread: getLaneId(): 0 -> 1, 1 -> 2 ... 31 -> 0
     const uint32_t circularLaneShift = (laneId + 1) & LANE_MASK;
 
-    // Number of elements before this digit??
+    // Where does the digit start
     const uint32_t digitOffset = blockIdx.x * numBlocks;
 
     // Calculate the number of full block-sized chunks we need to process
@@ -312,7 +317,6 @@ __global__ void RadixScan(
         // Load data into shared memory with circular shift pattern
         const uint32_t globalIdx = blockStart + tid;
         s_scan[tid] = passHist[globalIdx + digitOffset];
-        __syncthreads();
 
         // Step 1: Perform warp-level scan
         s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
@@ -324,7 +328,8 @@ __global__ void RadixScan(
         }
         __syncthreads();
 
-        const uint32_t outputIdx = circularLaneShift + (globalIdx & ~LANE_MASK);
+        // const uint32_t outputIdx = circularLaneShift + (globalIdx & ~LANE_MASK);
+        const uint32_t outputIdx = tid + (fullBlocksEnd & ~LANE_MASK);
         if (outputIdx < numBlocks) {
             passHist[outputIdx + digitOffset] =
                 (laneId != LANE_MASK ? s_scan[tid] : 0) +
@@ -338,36 +343,37 @@ __global__ void RadixScan(
     }
 
     // Remaining elements handled similarly...
-    // const uint32_t remainingStart = fullBlocksEnd;
-    if(tid < numBlocks && blockIdx.x <= 4) {
-        printf("Full block[%u] DigitOffset[%u] Thread[%u]: %u %u\n", blockIdx.x, digitOffset, tid, fullBlocksEnd + tid + digitOffset, passHist[fullBlocksEnd + tid + digitOffset]);
-    }
+    uint32_t remainingElements = numBlocks - fullBlocksEnd;
+    // reduction += s_scan[remainingElements - 1];
+
     if (fullBlocksEnd + tid < numBlocks) {
         // Load remaining data with circular shift pattern
         s_scan[tid] = passHist[fullBlocksEnd + tid + digitOffset];    
-        // s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
+        s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
+        __syncthreads();
+   
+        if (tid < blockDim.x / WARP_SIZE) {
+            s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
+        }
         __syncthreads();
 
-        if(blockIdx.x == 4 && tid == numBlocks - 1) {
-            for(uint32_t i=0; i<blockDim.x; ++i) {
-                printf("%u ", s_scan[i]);
-            }
-            printf("\n");
-        }   
-        // if (tid < blockDim.x / WARP_SIZE) {
-        //     s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
-        // }
-        // __syncthreads();
+        const uint32_t outputIdx = tid + (fullBlocksEnd & ~LANE_MASK);
 
-        // const uint32_t outputIdx = circularLaneShift + (fullBlocksEnd & ~LANE_MASK);
-        
-        // if (outputIdx < numBlocks) {
-        //     passHist[outputIdx + digitOffset] =
-        //         (laneId != LANE_MASK ? s_scan[tid] : 0) +
-        //         (tid >= WARP_SIZE ? 
-        //             s_scan[(tid & ~LANE_MASK) - 1] : 0) +
-        //         reduction;
-        // }
+        if (outputIdx < numBlocks) {
+            passHist[outputIdx + digitOffset] =
+                (laneId != LANE_MASK ? s_scan[tid] : 0) +
+                (tid >= WARP_SIZE ? 
+                    s_scan[(tid & ~LANE_MASK) - 1] : 0) +
+                reduction;
+        }
+    }
+    // __syncthreads();
+    if(blockIdx.x == 1 && tid == numBlocks - 1) {
+        printf("\nDigit[%u]\n", blockIdx.x);
+        for(uint32_t i=0; i<blockDim.x; ++i) {
+            printf("[%u %u] ", s_scan[i], i < numBlocks ? passHist[digitOffset + i] : 0);
+        }
+        printf("\n");
     }
 }
 
