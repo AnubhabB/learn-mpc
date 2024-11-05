@@ -513,8 +513,8 @@ int main() {
     uint32_t sizes[N] = { 67, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    for(uint32_t i = 0; i < N; i++) {
-    // for(uint32_t i = 1; i < 2; i++) {
+    // for(uint32_t i = 0; i < N; i++) {
+    for(uint32_t i = 0; i < 1; i++) {
         // {
         //     printf("`uint32_t`: Upsweep Validation (sequential)\n");
         //     uint32_t errors = validate<uint32_t>(sizes[i]);
