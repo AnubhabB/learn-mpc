@@ -453,49 +453,58 @@ __global__ void RadixDownsweep(
     }
     __syncthreads();
 
-    if(blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
-        
-    }
+    
     // Update the first threads of warps
-    // if (threadIdx.x < (RADIX >> LANE_LOG))
-    //     s_warpHistograms[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_warpHistograms[threadIdx.x << LANE_LOG]);
-    // __syncthreads();
+    if (threadIdx.x < (RADIX >> LANE_LOG))
+        s_warpHistograms[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_warpHistograms[threadIdx.x << LANE_LOG]);
+    __syncthreads();
 
-    // if (threadIdx.x < RADIX && getLaneId())
-    //     s_warpHistograms[threadIdx.x] += __shfl_sync(0xfffffffe, s_warpHistograms[threadIdx.x - 1], 1);
-    // __syncthreads();
-
+    if (threadIdx.x < RADIX && getLaneId())
+        s_warpHistograms[threadIdx.x] += __shfl_sync(0xfffffffe, s_warpHistograms[threadIdx.x - 1], 1);
+    __syncthreads();
 
     //update offsets
-    // if(WARP_INDEX < activeWarps) {
-    //     if (WARP_INDEX) {
-    //         #pragma unroll 
-    //         for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-    //             const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
-    //             offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
-    //         }
-    //     } else {
-    //         #pragma unroll
-    //         for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-    //             offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
-    //     }
-    // }
-
+    if (WARP_INDEX) {
+        #pragma unroll 
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+            const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
+            offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
+    }
+    
 
     //load in threadblock reductions
-    // if (threadIdx.x < RADIX) {
-    //     s_localHistogram[threadIdx.x] = globalHist[threadIdx.x + (radixShift << LANE_LOG)] +
-    //         passHist[threadIdx.x * gridDim.x + blockIdx.x] - s_warpHistograms[threadIdx.x];
-    // }
-    // __syncthreads();
+    for(uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
+        s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
+            passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
+    }
+    __syncthreads();
 
-    // if(blockIdx.x == 0) {
-    //     if(threadIdx.x == blockDim.x - 1) {
-    //         for(uint32_t i=0;i<RADIX;++i) {
-    //             printf("[%u %u %u %u] ", i, s_warpHistograms[i], i < BIN_KEYS_PER_THREAD ? offsets[i] : 1234, s_localHistogram[i]);
-    //         }
-    //     }
+    if(blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
+        for(uint32_t i=0; i<maxElemInBlock; ++i) {
+            printf("[%u %u] ", i, sort[i]);
+        }
+        printf("\n-------------------\n");
+
+        for(uint32_t i=0; i<RADIX; ++i) {
+            printf("[%u %u %u]", i, s_warpHist[i], s_localHistogram[i]);
+        }
+    }
+    // if (threadIdx.x < RADIX) {
+    //     
     // }
+
+    if(blockIdx.x == 0) {
+        if(threadIdx.x == blockDim.x - 1) {
+            for(uint32_t i=0;i<RADIX;++i) {
+                printf("[%u %u %u %u] ", i, s_warpHistograms[i], i < BIN_KEYS_PER_THREAD ? offsets[i] : 1234, s_localHistogram[i]);
+            }
+        }
+    }
     
     //scatter keys into shared memory
     // #pragma unroll
@@ -503,7 +512,7 @@ __global__ void RadixDownsweep(
     //     s_warpHistograms[offsets[i]] = keys[i];
     // __syncthreads();
 
-    // //scatter runs of keys into device memory
+    //scatter runs of keys into device memory
     // if (blockIdx.x < gridDim.x - 1) {
     //     #pragma unroll BIN_KEYS_PER_THREAD
     //     for (uint32_t i = threadIdx.x; i < ; i += blockDim.x)
