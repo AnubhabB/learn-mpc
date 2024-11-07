@@ -172,10 +172,11 @@ struct Resources {
         // Calculate part_size based on shared memory constraints
         // res.numElemInBlock = min((uint32_t)available_shared_mem / type_size, size);
         uint32_t activeDownsweepThreads = ((res.numElemInBlock / BIN_KEYS_PER_THREAD) + LANE_MASK) & ~LANE_MASK;
+        // printf("Active downsweep threads: %u\n", activeDownsweepThreads);
 
         res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
         res.numScanThreads  = (res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
-        res.numDownsweepThreads = max(activeDownsweepThreads, 256);
+        res.numDownsweepThreads = activeDownsweepThreads;
         res.numDownsweepActiveWarps = activeDownsweepThreads / WARP_SIZE;
 
         return res;
@@ -263,7 +264,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             }
 
             printf("Sort data now: \n");
-            for(int i=0; i<64; i++) {
+            for(int i=0; i<128; i++) {
                 if(std::is_same<T, float>::value)
                     printf("[%d %f] ", i, sortData[i]);
                 else if(std::is_same<T, uint32_t>::value)
@@ -485,8 +486,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 size,
                 shift,
                 res.numElemInBlock,
-                res.downsweepSharedSize,
-                res.numDownsweepActiveWarps
+                res.downsweepSharedSize
+                // res.numDownsweepActiveWarps
             );
             c_ret = cudaGetLastError();
             if (c_ret) {
