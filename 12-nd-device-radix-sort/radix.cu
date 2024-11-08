@@ -377,6 +377,7 @@ __global__ void RadixDownsweep(
 ) {
     // Shared memory layout
     extern __shared__ uint32_t s_warpHistograms[]; // Number of warps needed = ceil(N / (WARP_SIZE * BIN_KEYS_PER_THREAD)); Size: num_warps * RADIX
+    extern __shared__ T s_tmpData[];               // Temporary storage of number of elements in block
     __shared__ uint32_t s_localHistogram[RADIX];
     volatile uint32_t* s_warpHist = &s_warpHistograms[WARP_INDEX << RADIX_LOG];
 
@@ -428,30 +429,60 @@ __global__ void RadixDownsweep(
         uint32_t preIncrementVal;
         // Update histogram count only once per warp
         if (bits == 0) {
-            preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[bitval >> radixShift & RADIX_MASK], __popc(warpFlags));
+            preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[(bitval >> radixShift) & RADIX_MASK], __popc(warpFlags));
+            // if(blockIdx.x == 0 && threadIdx.x == 63)
+            //     printf("Keys[%u]: %u Warp Flag: %u preIncrementalVal: %u\n", i, bitval, warpFlags, preIncrementVal);
         }
 
         offsets[i] = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
     }
     __syncthreads();
 
-    // if(blockIdx.x == 0 && threadIdx.x == 0) {
-    //     for(uint32_t i=0, t=blockOffset + ((BIN_KEYS_PER_THREAD << LANE_LOG) * WARP_INDEX) + getLaneId(); i<BIN_KEYS_PER_THREAD; ++i, t+=WARP_SIZE) {
-    //         printf("[%u %u][%u %u] ", i, t, keys[i], offsets[i]);
+    // if (threadIdx.x == 63 && blockIdx.x == 0) {
+    //     printf("\n=== Verification for Thread %u with radixShift[%u] ===\n", threadIdx.x, radixShift);
+    //     for (int i = 0; i < BIN_KEYS_PER_THREAD; i++) {
+    //         printf("Key[%d]: %u -> Offset: %u | (keys[i] >> radixShift) & RADIX_MASK: %u\n", i, keys[i], offsets[i], (keys[i] >> radixShift) & RADIX_MASK);
+            
+    //         // Verify offset is within bounds
+    //         if (offsets[i] >= size) {
+    //             printf("WARNING: Offset %u exceeds size %u\n", offsets[i], size);
+    //         }
+            
+    //         // Verify offset ordering within same radix digit
+    //         if (i > 0 && ((keys[i] >> radixShift & RADIX_MASK) == 
+    //                     (keys[i-1] >> radixShift & RADIX_MASK))) {
+    //             if (offsets[i] <= offsets[i-1]) {
+    //                 printf("WARNING: Non-monotonic offsets for same digit: %u <= %u\n",
+    //                     offsets[i], offsets[i-1]);
+    //             }
+    //         }
     //     }
+    //     // printf("==== Debug for Thread %u, Key[%d] ====\n", keyIndex);
+    //     // printf("Key Value: %u\n", keys[keyIndex]);
+    //     // printf("Radix Digit: %u\n", keys[keyIndex] >> radixShift & RADIX_MASK);
+    //     // printf("Warp Flags: 0x%08x\n", warpFlags);
+    //     // printf("Bits before current thread: %u\n", bits);
+    //     // printf("Pre-increment value: %u\n", preIncrementVal);
+    //     // printf("Final offset: %u\n", offsets[keyIndex]);
+    //     // printf("================================\n");
     // }
-    //exclusive prefix sum up the warp histograms
-    for(uint32_t i=threadIdx.x; i<RADIX; i += blockDim.x) {
-        uint32_t reduction = s_warpHistograms[i];
-        for(uint32_t j=i+RADIX; j<histSize; j+=RADIX) {
-            uint32_t whistTmp = s_warpHistograms[j];
-            s_warpHistograms[j] = reduction;
-            reduction += whistTmp;
-        }
+    // At this stage we have `warp-level` histograms
+    // exclusive prefix sum up the warp histograms
+    // Number of iterations needed to cover all RADIX elements
+    uint32_t numIterations = (RADIX + blockDim.x - 1) / blockDim.x;
 
-        s_warpHistograms[i] = InclusiveWarpScanCircularShift(reduction);
+    for(uint32_t i=0; i<numIterations; ++i) {
+        uint32_t elementIdx = i * blockDim.x + threadIdx.x;
+        if(elementIdx < RADIX) {  // Guard against overflow
+            uint32_t reduction = s_warpHistograms[elementIdx];
+            for(uint32_t j = elementIdx + RADIX; j < histSize; j += RADIX) {
+                reduction += s_warpHistograms[j];
+                s_warpHistograms[j] = reduction - s_warpHistograms[j];
+            }
+            s_warpHistograms[elementIdx] = InclusiveWarpScanCircularShift(reduction);
+        }
+        __syncthreads();  // Ensure all warps complete before next iteration
     }
-    __syncthreads();
 
     
     // Update the first threads of warps
@@ -463,60 +494,54 @@ __global__ void RadixDownsweep(
         s_warpHistograms[threadIdx.x] += __shfl_sync(0xfffffffe, s_warpHistograms[threadIdx.x - 1], 1);
     __syncthreads();
 
-    //update offsets
-    if (WARP_INDEX) {
-        #pragma unroll 
-        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-            const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
-            offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
-        }
-    } else {
-        #pragma unroll
-        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-            offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
-    }
-    
-
-    //load in threadblock reductions
-    for(uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
-        s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
-            passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
-    }
-    __syncthreads();
-
-    if(blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
-        for(uint32_t i=0; i<maxElemInBlock; ++i) {
-            printf("[%u %u] ", i, sort[i]);
-        }
-        printf("\n-------------------\n");
-
+    if(blockIdx.x == 0 && threadIdx.x == 63) {
+        printf("Block level histogram: ============================\n");
         for(uint32_t i=0; i<RADIX; ++i) {
-            printf("[%u %u %u]", i, s_warpHist[i], s_localHistogram[i]);
+            printf("[%u %u] ", i, s_warpHistograms[i]);
         }
+        printf("\n=================================================\n");
     }
-    // if (threadIdx.x < RADIX) {
-    //     
-    // }
 
-    if(blockIdx.x == 0) {
-        if(threadIdx.x == blockDim.x - 1) {
-            for(uint32_t i=0;i<RADIX;++i) {
-                printf("[%u %u %u %u] ", i, s_warpHistograms[i], i < BIN_KEYS_PER_THREAD ? offsets[i] : 1234, s_localHistogram[i]);
-            }
-        }
-    }
+    // //update offsets
+    // if (WARP_INDEX) {
+    //     #pragma unroll 
+    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //         const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
+    //         offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
+    //     }
+    // } else {
+    //     #pragma unroll
+    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+    //         offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
+    // }
     
-    //scatter keys into shared memory
-    // #pragma unroll
-    // for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-    //     s_warpHistograms[offsets[i]] = keys[i];
+
+    // //load in threadblock reductions
+    // for(uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
+    //     s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
+    //         passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
+    // }
     // __syncthreads();
 
-    //scatter runs of keys into device memory
-    // if (blockIdx.x < gridDim.x - 1) {
-    //     #pragma unroll BIN_KEYS_PER_THREAD
-    //     for (uint32_t i = threadIdx.x; i < ; i += blockDim.x)
-    //         alt[s_localHistogram[s_warpHistograms[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
+    // //scatter keys into shared memory
+    // #pragma unroll
+    // for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+    //     s_tmpData[offsets[i]] = keys[i];
+    // }
+    // __syncthreads();
+
+    // //scatter runs of keys into device memory
+    // // if (blockIdx.x < gridDim.x - 1) {
+    // uint32_t nItems = min(maxElemInBlock, size - blockOffset);
+    // for (uint32_t i = threadIdx.x; i < nItems; i += blockDim.x) {
+    //     // printf("[i[%u] localHist[%u] trg[%u] -> %u] ", i, s_tmpData[i] >> radixShift & RADIX_MASK, s_localHistogram[s_tmpData[i] >> radixShift & RADIX_MASK] + i, s_tmpData[i]);
+    //     uint32_t bitval = toBits<T>(s_tmpData[i]);
+    //     alt[s_localHistogram[bitval >> radixShift & RADIX_MASK] + i] = s_tmpData[i];
+    // }
+
+
+    // -----------------------------------------------------------------------------------
+            // alt[s_localHistogram[s_tmpData[i] >> radixShift & RADIX_MASK] + i] = s_warpHistograms[i];
     // }
 
     // if (blockIdx.x == gridDim.x - 1)
