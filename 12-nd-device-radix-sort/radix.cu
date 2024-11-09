@@ -481,7 +481,7 @@ __global__ void RadixDownsweep(
             }
             s_warpHistograms[elementIdx] = InclusiveWarpScanCircularShift(reduction);
         }
-        __syncthreads();  // Ensure all warps complete before next iteration
+        __syncthreads();
     }
 
     
@@ -494,49 +494,107 @@ __global__ void RadixDownsweep(
         s_warpHistograms[threadIdx.x] += __shfl_sync(0xfffffffe, s_warpHistograms[threadIdx.x - 1], 1);
     __syncthreads();
 
-    if(blockIdx.x == 0 && threadIdx.x == 63) {
+    //update offsets
+    if (WARP_INDEX) {
+        #pragma unroll 
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+            const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
+            offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
+    }
+    
+
+    //load in threadblock reductions
+    for(uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
+        s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
+            passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
+    }
+    __syncthreads();
+
+    if(blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
         printf("Block level histogram: ============================\n");
-        for(uint32_t i=0; i<RADIX; ++i) {
-            printf("[%u %u] ", i, s_warpHistograms[i]);
+        for(uint32_t i=0; i<RADIX/2; ++i) {
+            // printf("[%u %u %u %u %u] ", i, s_localHistogram[i], globalHist[i], passHist[i * gridDim.x], passHist[i * gridDim.x + 1]);
+            printf("Digit %u globalHist: %u passHists: [%u %u] s_warpHistogram: %u localHistogram: %u\n", i, globalHist[i], passHist[i * gridDim.x], passHist[i * gridDim.x + 1], s_warpHistograms[i], s_localHistogram[i]);
         }
         printf("\n=================================================\n");
     }
 
-    // //update offsets
-    // if (WARP_INDEX) {
-    //     #pragma unroll 
-    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-    //         const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
-    //         offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
+    // if(blockIdx.x == 0 && (threadIdx.x == 63)) {
+    //     printf("Thread %d:\n", threadIdx.x);
+    //     // Print s_localHistogram values for first few LSBs
+    //     printf("s_localHistogram[0-3]: %u %u %u %u\n", 
+    //         s_localHistogram[0], s_localHistogram[1], 
+    //         s_localHistogram[2], s_localHistogram[3]);
+        
+    //     // Print offsets and corresponding keys
+    //     for(int i=0; i<4; i++) {
+    //         printf("offset[%d]=%u for key=%u (LSB=%u)\n", 
+    //             i, offsets[i], s_tmpData[offsets[i]], 
+    //             s_tmpData[offsets[i]] & RADIX_MASK);
     //     }
-    // } else {
-    //     #pragma unroll
-    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-    //         offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
     // }
-    
-
-    // //load in threadblock reductions
-    // for(uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
-    //     s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
-    //         passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
+    // if(threadIdx.x == 0 && i < 4) {
+    //     uint32_t lsb = s_tmpData[i] >> radixShift & RADIX_MASK;
+    //     uint32_t pos = s_localHistogram[lsb] + i;
+    //     printf("Scattering: value=%u LSB=%u hist=%u final_pos=%u\n", 
+    //         s_tmpData[i], lsb, s_localHistogram[lsb], pos);
     // }
-    // __syncthreads();
 
-    // //scatter keys into shared memory
-    // #pragma unroll
-    // for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
-    //     s_tmpData[offsets[i]] = keys[i];
+    //scatter keys into shared memory
+    #pragma unroll
+    for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i) {
+        s_tmpData[offsets[i]] = keys[i];
+    }
+    __syncthreads();
+
+    // if(threadIdx.x == 0 && blockIdx.x == 0) {
+    //     printf("Offsets ======================\n");
+    //     for(uint32_t i=0; i<BIN_KEYS_PER_THREAD; ++i) {
+    //         printf("[%u %u %u] ", i, offsets[i], keys[i]);
+    //     }
+    //     printf("\n=============================\n");
     // }
-    // __syncthreads();
 
-    // //scatter runs of keys into device memory
-    // // if (blockIdx.x < gridDim.x - 1) {
+    //scatter runs of keys into device memory
+    if(blockIdx.x < gridDim.x - 1) {
+        for(uint32_t i=threadIdx.x; i<maxElemInBlock; i += blockDim.x) {
+            alt[s_localHistogram[s_tmpData[i] >> radixShift & RADIX_MASK] + i] = s_tmpData[i];
+            // if(threadIdx.x == 0) {
+            //     uint32_t lsb = s_tmpData[i] >> radixShift & RADIX_MASK;
+            //     uint32_t pos = s_localHistogram[lsb] + i;
+            //     printf("Scattering[i = %u]: value=%u LSB=%u hist=%u final_pos=%u\n", 
+            //         i, s_tmpData[i], lsb, s_localHistogram[lsb], pos);
+            // }
+        }
+    } else {
+        const uint32_t finalPartSize = size - blockOffset;
+        // Last dim might have lesser number of elements
+        for(uint32_t i=threadIdx.x; i<finalPartSize; i += blockDim.x) {
+            alt[s_localHistogram[s_tmpData[i] >> radixShift & RADIX_MASK] + i] = s_tmpData[i];
+        }
+    }
+
+    __syncthreads();
+
+    // // // if (blockIdx.x < gridDim.x - 1) {
     // uint32_t nItems = min(maxElemInBlock, size - blockOffset);
     // for (uint32_t i = threadIdx.x; i < nItems; i += blockDim.x) {
     //     // printf("[i[%u] localHist[%u] trg[%u] -> %u] ", i, s_tmpData[i] >> radixShift & RADIX_MASK, s_localHistogram[s_tmpData[i] >> radixShift & RADIX_MASK] + i, s_tmpData[i]);
     //     uint32_t bitval = toBits<T>(s_tmpData[i]);
     //     alt[s_localHistogram[bitval >> radixShift & RADIX_MASK] + i] = s_tmpData[i];
+    // }
+
+    // if(blockIdx.x == gridDim.x - 1 && threadIdx.x == blockDim.x - 1) {
+    //     printf("Sorted: ============================\n");
+    //     for(uint32_t i=0; i<maxElemInBlock; ++i) {
+    //         printf("[%u %u] ", i, alt[i]);
+    //     }
+    //     printf("\n=================================================\n");
     // }
 
 
