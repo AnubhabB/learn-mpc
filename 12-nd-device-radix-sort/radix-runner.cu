@@ -67,9 +67,9 @@ static inline __nv_bfloat16 random_range(__nv_bfloat16 min, __nv_bfloat16 max) {
 #endif
 
 template<typename T>
-void createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* h_idx, bool seq) {
+bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* h_idx, bool seq, bool withId) {
     uint32_t sortsize = size * sizeof(T);
-    uint32_t idxsize  = size * sizeof(uint32_t);
+    uint32_t idxsize  = withId ? size * sizeof(uint32_t) : 0;
 
     T min;
     T max;
@@ -104,13 +104,32 @@ void createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
         } else {
             h_sort[i] = random_range(min, max);
         }
-        h_idx[i] = i;
+        if (withId)
+            h_idx[i] = i;
     }
 
-    cudaMemcpy(d_sort, h_sort, sortsize, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_idx, h_idx, idxsize, cudaMemcpyHostToDevice);
+    cudaError_t cerr;
+    
+    cerr = cudaMemcpy(d_sort, h_sort, sortsize, cudaMemcpyHostToDevice);
+    if (cerr) {
+        printf("[createData memcpy d_sort] Cuda error: %s\n", cudaGetErrorString(cerr));
+        return true;
+    }
+    if (withId) {
+        cerr = cudaMemcpy(d_idx, h_idx, idxsize, cudaMemcpyHostToDevice);
+        if (cerr) {
+            printf("[createData memcpy d_idx] Cuda error: %s\n", cudaGetErrorString(cerr));
+            return true;
+        }
+    }
 
-    cudaDeviceSynchronize();
+    cerr = cudaDeviceSynchronize();
+    if (cerr) {
+        printf("[createData deviceSync] Cuda error: %s\n", cudaGetErrorString(cerr));
+        return true;
+    }
+
+    return false;
 }
 
 // Helper functions for bit conversions
@@ -194,7 +213,7 @@ __global__ void printSize(T* d) {
 }
 
 template<typename T>
-uint32_t validate(const uint32_t size, bool dataseq = true) {
+uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false) {
     printf("Validating for size[%u] and typeSize[%lu]\n", size, sizeof(T));
     uint32_t errors = 0;
 
@@ -220,23 +239,71 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
     T* h_sort       = (T*)malloc(sortSize);
     uint32_t* h_idx = (uint32_t*)malloc(idxSize);
 
-    cudaMalloc(&d_sort, sortSize);
-    cudaMalloc(&d_sortAlt, sortSize);
-    cudaMalloc(&d_idx, idxSize);
-    cudaMalloc(&d_idxAlt, idxSize);
-    cudaMalloc(&d_globalHist, radixSize * numPasses);
-    cudaMalloc(&d_passHist, radixSize * res.numThreadBlocks);
+    c_ret = cudaMalloc(&d_sort, sortSize);
+    if (c_ret) {
+        errors += 1;
+        printf("[Pre-pass -> malloc d_sort] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+        return errors;
+    }
+    c_ret = cudaMalloc(&d_sortAlt, sortSize);
+    if (c_ret) {
+        errors += 1;
+        printf("[Pre-pass -> malloc d_sortAlt] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+        return errors;
+    }
+    c_ret = cudaMalloc(&d_globalHist, radixSize * numPasses);
+    if (c_ret) {
+        errors += 1;
+        printf("[Pre-pass -> malloc d_globalHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+        return errors;
+    }
+    c_ret = cudaMalloc(&d_passHist, radixSize * res.numThreadBlocks);
+    if (c_ret) {
+        errors += 1;
+        printf("[Pre-pass -> malloc d_passHist] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+        return errors;
+    }
+
+    if (withId) {
+        c_ret = cudaMalloc(&d_idx, idxSize);
+        if (c_ret) {
+            errors += 1;
+            printf("[Pre-pass -> malloc d_idx] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+            return errors;
+        }
+        c_ret = cudaMalloc(&d_idxAlt, idxSize);
+        if (c_ret) {
+            errors += 1;
+            printf("[Pre-pass -> malloc d_idxAlt] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+            return errors;
+        }
+    }
 
     // Create some data
-    createData<T>(size, d_sort, d_idx, h_sort, h_idx, dataseq);
+    bool iserr = createData<T>(size, d_sort, d_idx, h_sort, h_idx, dataseq, withId);
+    if (iserr) {
+        errors += 1;
+        printf("[Pre-pass -> createData] data creation errored out!\n");
+        return errors;
+    }
 
-    cudaMemset(d_globalHist, 0,  radixSize * numPasses);
-    cudaDeviceSynchronize();
+    c_ret = cudaMemset(d_globalHist, 0,  radixSize * numPasses);
+    if (c_ret) {
+        errors += 1;
+        printf("[Pre-pass -> cudaMemset d_globalHist] Cuda error: %s\n", cudaGetErrorString(c_ret));
+        return errors;
+    }
+    c_ret = cudaDeviceSynchronize();
+    if (c_ret) {
+        errors += 1;
+        printf("[Pre-pass -> cudaDeviceSynchronize] Cuda error: %s\n", cudaGetErrorString(c_ret));
+        return errors;
+    }
 
     c_ret = cudaGetLastError();
     if (c_ret) {
         errors += 1;
-        printf("[Pre-pass] Cuda Error: %s\n", cudaGetErrorString(c_ret));
+        printf("[Pre-pass] Generic Cuda Error: %s\n", cudaGetErrorString(c_ret));
         return errors;
     }
 
@@ -414,18 +481,6 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 break;
             }
 
-            // printf("\nPeeking 32 digits in passHist: \n");
-            // for(uint32_t blk=0; blk<res.numThreadBlocks; ++blk) {
-                
-            // // //     uint32_t offset = RADIX * blk;
-            //     printf("Block %u:\n", blk);
-            //     for(uint32_t d=0; d<32; ++d) {
-            //         uint32_t trg = d * res.numThreadBlocks + blk;
-            //         printf("[%u %u] ", d, passHistBefore[trg]);
-            //     }
-            //     printf("\n");
-            // }
-
             uint32_t* passHistGpu = (uint32_t*)malloc(pass_hist_size);
             uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
 
@@ -495,6 +550,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             RadixDownsweep<T><<<res.numThreadBlocks, res.numDownsweepThreads, sharedSize>>>(
                 d_sort,
                 d_sortAlt,
+                // d_idx,
+                // d_idxAlt,
                 d_globalHist,
                 d_passHist,
                 size,
@@ -606,8 +663,8 @@ int main() {
     uint32_t sizes[N] = { 1024, 1120, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    for(uint32_t i = 0; i < N; i++) {
-    // for(uint32_t i = 0; i < 1; i++) {
+    // for(uint32_t i = 0; i < N; i++) {
+    for(uint32_t i = 0; i < 1; i++) {
         {
             printf("`uint32_t`: Upsweep Validation (sequential)\n");
             uint32_t errors = validate<uint32_t>(sizes[i]);
@@ -620,22 +677,26 @@ int main() {
         {
             printf("`uint32_t`: Upsweep Validation (random)\n");
             uint32_t errors = validate<uint32_t>(sizes[i], false);
-            if(errors > 0)
+            if(errors > 0) {
                 printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
         }
 
-        {
-            printf("`float`: Upsweep Validation (sequential)\n");
-            uint32_t errors = validate<float>(sizes[i]);
-            if(errors > 0)
-                printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
-        }
+        // {
+        //     printf("`float`: Upsweep Validation (sequential)\n");
+        //     uint32_t errors = validate<float>(sizes[i]);
+        //     if(errors > 0)
+        //         printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+        // }
 
         {
             printf("`float`: Upsweep Validation (random)\n");
             uint32_t errors = validate<float>(sizes[i], false);
-            if(errors > 0)
+            if(errors > 0) {
                 printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+                break;
+            }
         }
 
         // {

@@ -85,7 +85,7 @@ __device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val) {
 template<typename T>
 __device__ inline uint32_t toBits(T val) {
     if constexpr (std::is_same<T, float>::value) {
-        if(isinf(val)) {
+        if (isinf(val)) {
             // Handle infinity
             return val < 0.0f ? 0 : 0xFFFFFFFF;
         }
@@ -169,7 +169,7 @@ __device__ inline T getTypeMax() {
 // globalHist - converts these frequencies into cumulative counts (prefix sums)
 template<typename T>
 __global__ void RadixUpsweep(
-    T* sort,
+    T* keys,
     uint32_t* globalHist,
     uint32_t* passHist,
     const uint32_t size,
@@ -192,14 +192,14 @@ __global__ void RadixUpsweep(
     const uint32_t block_end = min(block_start + maxElemInBlock, size);
     const uint32_t elements_in_block = block_end - block_start;
 
-    // if(blockIdx.x == printBlock && (threadIdx.x == 0 || threadIdx.x == 15)) {
+    // if (blockIdx.x == printBlock && (threadIdx.x == 0 || threadIdx.x == 15)) {
     //     printf("Thread[%u]: maxElemInBlock[%u] block_start[%u] block_end[%u] elements_in_block[%u]\n", threadIdx.x, maxElemInBlock, block_start, block_end, elements_in_block);
     // }
 
-    // if(threadIdx.x == 0 && blockIdx.x == printBlock) {
+    // if (threadIdx.x == 0 && blockIdx.x == printBlock) {
     //     // printf("\nBlock[%u]: ", blockIdx.x);
-    //     for(uint32_t i=block_start; i<block_end; ++i) {
-    //         printf("%u ", sort[i]);
+    //     for (uint32_t i=block_start; i<block_end; ++i) {
+    //         printf("%u ", i]);
     //     }
     //     printf("--\n");
     // }
@@ -213,14 +213,14 @@ __global__ void RadixUpsweep(
     for (uint32_t i = threadIdx.x; i < full_vecs; i += blockDim.x) {
         const uint32_t idx = block_start + i * vec_size;
         
-        if(idx < vec_end) {
-            // if(blockIdx.x == printBlock) {
+        if (idx < vec_end) {
+            // if (blockIdx.x == printBlock) {
             //     printf("Idx[%u] ", idx);
             // }
             #pragma unroll
             for (int j = 0; j < vec_size; ++j) {
-                uint32_t bits = toBits(sort[idx + j]);
-                // if(blockIdx.x == printBlock) {
+                uint32_t bits = toBits(keys[idx + j]);
+                // if (blockIdx.x == printBlock) {
                 //     printf("sort[%u %u]: [%u %u %u] ", idx, idx + j, sort[idx + j], bits, bits >> radixShift & RADIX_MASK);
                 // }
                 atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
@@ -230,7 +230,7 @@ __global__ void RadixUpsweep(
     
     // Process remaining elements
     for (uint32_t i = threadIdx.x + vec_end; i < block_end; i += blockDim.x) {
-        uint32_t bits = toBits(sort[i]);
+        uint32_t bits = toBits(keys[i]);
         atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
     }
 
@@ -246,9 +246,9 @@ __global__ void RadixUpsweep(
         s_globalHist[i] = InclusiveWarpScanCircularShift(s_globalHist[i]);
     }
     __syncthreads();
-    // if(threadIdx.x == 15 && blockIdx.x == printBlock) {
+    // if (threadIdx.x == 15 && blockIdx.x == printBlock) {
     //     printf("\nBlockHist[%u]: ", blockIdx.x);
-    //     for(uint32_t i=0; i<RADIX; ++i) {
+    //     for (uint32_t i=0; i<RADIX; ++i) {
     //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
     //     }
     //     printf("--\n");
@@ -259,9 +259,9 @@ __global__ void RadixUpsweep(
         s_globalHist[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHist[threadIdx.x << LANE_LOG]);
     __syncthreads();
 
-    // if(threadIdx.x == 15 && blockIdx.x == printBlock) {
+    // if (threadIdx.x == 15 && blockIdx.x == printBlock) {
     //     printf("\nBlockHist[%u]: ", blockIdx.x);
-    //     for(uint32_t i=0; i<RADIX; ++i) {
+    //     for (uint32_t i=0; i<RADIX; ++i) {
     //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
     //     }
     //     printf("--\n");
@@ -276,9 +276,9 @@ __global__ void RadixUpsweep(
         );
     }
 
-    // if(threadIdx.x == 15 && blockIdx.x == printBlock) {
+    // if (threadIdx.x == 15 && blockIdx.x == printBlock) {
     //     printf("\nBlockHist[%u]: ", blockIdx.x);
-    //     for(uint32_t i=0; i<RADIX; ++i) {
+    //     for (uint32_t i=0; i<RADIX; ++i) {
     //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
     //     }
     //     printf("--\n");
@@ -310,7 +310,7 @@ __global__ void RadixScan(
     uint32_t reduction = 0;
 
     uint32_t tidx = tid;
-    for(; tidx<fullBlocksEnd; tidx += blockDim.x) {
+    for (; tidx<fullBlocksEnd; tidx += blockDim.x) {
         s_scan[tid] = passHist[tid + digitOffset];
         
         // Perform warp-level scan
@@ -336,14 +336,14 @@ __global__ void RadixScan(
     }
 
     // Remaining elements handled similarly...
-    if(tidx < numBlocks) {
+    if (tidx < numBlocks) {
         s_scan[tid] = passHist[tid + digitOffset];
     }
 
     s_scan[tid] = InclusiveWarpScan(s_scan[tid]);
     __syncthreads();
 
-    if(tid < (blockDim.x >> LANE_LOG)) {
+    if (tid < (blockDim.x >> LANE_LOG)) {
         s_scan[((tid + 1) << LANE_LOG) - 1] = ActiveInclusiveWarpScan(s_scan[((tid + 1) << LANE_LOG) - 1]);
     }
     __syncthreads();
@@ -357,9 +357,9 @@ __global__ void RadixScan(
             reduction;
     }
 
-    // if(blockIdx.x == 30 && tid == numBlocks - 1) {
+    // if (blockIdx.x == 30 && tid == numBlocks - 1) {
     //     printf("\nDigit[%u]\n", blockIdx.x);
-    //     for(uint32_t i=0; i<blockDim.x; ++i) {
+    //     for (uint32_t i=0; i<blockDim.x; ++i) {
     //         printf("[%u %u] ", s_scan[i], i < numBlocks ? passHist[digitOffset + i] : 0);
     //     }
     //     printf("\n");
@@ -368,10 +368,12 @@ __global__ void RadixScan(
 
 template<typename T>
 __global__ void RadixDownsweep(
-    T* sort,                        // Input array
-    T* alt,                         // Output array
-    uint32_t* globalHist,           // Global histogram
-    uint32_t* passHist,             // Pass histogram
+    T* keys,                        // Input array
+    T* keysAlt,                     // Output array
+    // uint32_t* vals,                 // Optional values to be sorted
+    // uint32_t* valsAlt,              // Output array
+    const uint32_t* globalHist,     // Global histogram
+    const uint32_t* passHist,       // Pass histogram
     const uint32_t size,            // Total elements to sort
     const uint32_t radixShift,      // current radixShift bit
     const uint32_t maxElemInBlock,  // Number of elements processed per partition/ block
@@ -381,12 +383,12 @@ __global__ void RadixDownsweep(
     // Shared memory layout
     // `s_tmp` would be used for `s_warpHistograms` and later for `s_keys` and `s_values` (optional)  
     extern __shared__ uint32_t s_tmp[]; // Number of warps needed = ceil(N / (WARP_SIZE * numKeysPerThread)); Size: num_warps * RADIX
-
-    uint32_t* s_warpHistograms = s_tmp;
     __shared__ uint32_t s_localHistogram[RADIX];
     volatile uint32_t* s_warpHist = &s_tmp[WARP_INDEX << RADIX_LOG];
 
-    
+    // for warp histogram temp storage
+    uint32_t* s_warpHistograms = s_tmp;
+
     // The partition offset of keys to work with
     const uint32_t blockOffset = blockIdx.x * maxElemInBlock;
 
@@ -394,7 +396,7 @@ __global__ void RadixDownsweep(
     for (uint32_t i = threadIdx.x; i < histSize; i += blockDim.x)
         s_tmp[i] = 0;
 
-    T keys[BIN_KEYS_PER_THREAD];
+    T threadKeys[BIN_KEYS_PER_THREAD];
     uint16_t offsets[BIN_KEYS_PER_THREAD];
 
     //load keys
@@ -411,8 +413,8 @@ __global__ void RadixDownsweep(
     // last when scattered. This allows for effortless divergence free sorting
     // of the final partition.
     #pragma unroll
-    for(uint32_t i=0, t=blockOffset + ((numKeysPerThread << LANE_LOG) * WARP_INDEX) + getLaneId(); i<numKeysPerThread;++i, t+=WARP_SIZE) {
-        keys[i] = t < size ? sort[t] : getTypeMax<T>();
+    for (uint32_t i=0, t=blockOffset + ((numKeysPerThread << LANE_LOG) * WARP_INDEX) + getLaneId(); i<numKeysPerThread;++i, t+=WARP_SIZE) {
+        threadKeys[i] = t < size ? keys[t] : getTypeMax<T>();
     }
     __syncthreads();
 
@@ -420,7 +422,7 @@ __global__ void RadixDownsweep(
     // Computes warp level histogram for digits
     #pragma unroll
     for (uint32_t i = 0; i < numKeysPerThread; ++i) {
-        uint32_t bitval = toBits<T>(keys[i]);
+        uint32_t bitval = toBits<T>(threadKeys[i]);
 
         // creating mask for threads in a warp that have same bit value as keys[i]
         unsigned warpFlags = 0xffffffff;
@@ -437,8 +439,6 @@ __global__ void RadixDownsweep(
         // Update histogram count only once per warp
         if (bits == 0) {
             preIncrementVal = atomicAdd((uint32_t*)&s_warpHist[(bitval >> radixShift) & RADIX_MASK], __popc(warpFlags));
-            // if(blockIdx.x == 0 && threadIdx.x == 63)
-            //     printf("Keys[%u]: %u Warp Flag: %u preIncrementalVal: %u\n", i, bitval, warpFlags, preIncrementVal);
         }
 
         offsets[i] = __shfl_sync(0xffffffff, preIncrementVal, __ffs(warpFlags) - 1) + bits;
@@ -492,7 +492,7 @@ __global__ void RadixDownsweep(
     // __syncthreads();
     // At this stage we have `warp-level` histograms
     // exclusive prefix sum up the warp histograms
-    if(threadIdx.x < RADIX) {
+    if (threadIdx.x < RADIX) {
         uint32_t reduction = s_warpHistograms[threadIdx.x];
         for (uint32_t i = threadIdx.x + RADIX; i < histSize; i += RADIX) {
             reduction += s_warpHistograms[i];
@@ -507,11 +507,11 @@ __global__ void RadixDownsweep(
     // uint32_t startIdx = threadIdx.x * digitsPerThread;
     // uint32_t endIdx = min(startIdx + digitsPerThread, RADIX);
 
-    // if(startIdx < RADIX) {
-    //     for(uint32_t idx = startIdx; idx < endIdx; ++idx) {
+    // if (startIdx < RADIX) {
+    //     for (uint32_t idx = startIdx; idx < endIdx; ++idx) {
     //         uint32_t reduction = s_warpHistograms[idx];
     //         // Process column for this digit
-    //         for(uint32_t i = idx + RADIX; i < histSize; i += RADIX) {
+    //         for (uint32_t i = idx + RADIX; i < histSize; i += RADIX) {
     //             reduction += s_warpHistograms[i];
     //             s_warpHistograms[i] = reduction - s_warpHistograms[i];
     //         }
@@ -541,7 +541,7 @@ __global__ void RadixDownsweep(
 
     // if (threadIdx.x == 63 && blockIdx.x == 0) {
     //     printf("\n=== Verification for Thread %u with radixShift[%u] After Exclusive prefix sum ===\n", threadIdx.x, radixShift);
-    //     for(uint32_t i = 0; i < RADIX; ++i) {
+    //     for (uint32_t i = 0; i < RADIX; ++i) {
     //         printf("[%u %u] ", i, s_warpHistograms[i]);
     //     }
     //     printf("\n\n");
@@ -600,7 +600,7 @@ __global__ void RadixDownsweep(
     // __syncthreads();
     // if (threadIdx.x == 63 && blockIdx.x == 0) {
     //     printf("\n=== Verification for Thread %u with radixShift[%u] After Exclusive prefix sum ===\n", threadIdx.x, radixShift);
-    //     for(uint32_t i = 0; i < RADIX; ++i) {
+    //     for (uint32_t i = 0; i < RADIX; ++i) {
     //         printf("[%u %u] ", i, s_warpHistograms[i]);
     //     }
     //     printf("\n\n");
@@ -610,26 +610,26 @@ __global__ void RadixDownsweep(
     if (WARP_INDEX) {
         #pragma unroll
         for (uint32_t i = 0; i < numKeysPerThread; ++i) {
-            const uint32_t t2 = toBits(keys[i]) >> radixShift & RADIX_MASK;
+            const uint32_t t2 = toBits(threadKeys[i]) >> radixShift & RADIX_MASK;
             offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
         }
     } else {
         #pragma unroll
         for (uint32_t i = 0; i < numKeysPerThread; ++i)
-            offsets[i] += s_warpHistograms[toBits(keys[i]) >> radixShift & RADIX_MASK];
+            offsets[i] += s_warpHistograms[toBits(threadKeys[i]) >> radixShift & RADIX_MASK];
     }
     
 
     //load in threadblock reductions
-    for(uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
+    for (uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
         s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
             passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
     }
     __syncthreads();
 
-    // if(blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
+    // if (blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
     //     printf("Block level histogram: ============================\n");
-    //     for(uint32_t i=0; i<RADIX/2; ++i) {
+    //     for (uint32_t i=0; i<RADIX/2; ++i) {
     //         // printf("[%u %u %u %u %u] ", i, s_localHistogram[i], globalHist[i], passHist[i * gridDim.x], passHist[i * gridDim.x + 1]);
     //         printf("Digit %u globalHist: %u passHists: [%u %u] s_warpHistogram: %u s_localHistogram: %u\n", i, globalHist[i], passHist[i * gridDim.x], passHist[i * gridDim.x + 1], s_warpHistograms[i], s_localHistogram[i]);
     //     }
@@ -643,22 +643,26 @@ __global__ void RadixDownsweep(
     // scatter keys into shared memory
     // #pragma unroll BIN_KEYS_PER_THREAD
     for (uint32_t i = 0; i < numKeysPerThread; ++i) {
-        s_keys[offsets[i]] = keys[i];
+        s_keys[offsets[i]] = threadKeys[i];
     }
     __syncthreads();
 
     //scatter runs of keys into device memory
-    if(blockIdx.x < gridDim.x - 1) {
-        for(uint32_t i=threadIdx.x; i<maxElemInBlock; i += blockDim.x) {
-            alt[s_localHistogram[toBits<T>(s_keys[i]) >> radixShift & RADIX_MASK] + i] = s_keys[i];
+    if (blockIdx.x < gridDim.x - 1) {
+        for (uint32_t i=threadIdx.x; i<maxElemInBlock; i += blockDim.x) {
+            keysAlt[s_localHistogram[toBits<T>(s_keys[i]) >> radixShift & RADIX_MASK] + i] = s_keys[i];
         }
     } else {
         const uint32_t finalPartSize = size - blockOffset;
         // Last dim might have lesser number of elements
-        for(uint32_t i=threadIdx.x; i<finalPartSize; i += blockDim.x) {
-            alt[s_localHistogram[toBits<T>(s_keys[i]) >> radixShift & RADIX_MASK] + i] = s_keys[i];
+        for (uint32_t i=threadIdx.x; i<finalPartSize; i += blockDim.x) {
+            keysAlt[s_localHistogram[toBits<T>(s_keys[i]) >> radixShift & RADIX_MASK] + i] = s_keys[i];
         }
     }
 
-    __syncthreads();
+    // __syncthreads();
+
+    // if (vals == nullptr) {
+    //     printf("Mogogofofofofofofo");
+    // }
 }
