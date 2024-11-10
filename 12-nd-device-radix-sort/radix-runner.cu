@@ -82,8 +82,8 @@ void createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
             min = (uint32_t)0;
             max = size <= 1024 ? 64 : (uint32_t)320000;
         } else if(std::is_same<T, float>::value) {
-            min = (float)-512.0;
-            max = (float)24000.0;
+            min = -24000.0f;
+            max = 24000.0f;
         }
         //  else if(std::is_same<T, __fp16>::value) {
         //     float mn = -32.0;
@@ -119,7 +119,7 @@ inline uint32_t toBitsCpu(T val) {
     if constexpr (std::is_same<T, float>::value) {
         uint32_t fuint;
         memcpy(&fuint, &val, sizeof(float));
-        return fuint ^ ((fuint >> 31) | 0x80000000);
+        return (fuint & 0x80000000) ? ~fuint : fuint ^ 0x80000000;
     }
     else if constexpr (std::is_same<T, __half>::value) {
         uint16_t bits = __half_as_ushort(val);
@@ -146,14 +146,16 @@ struct Resources {
     uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
     uint32_t numScanThreads; // number of scan threads to launch should be multiples of 32 (WARP_SIZE) but based on number of blocks
     uint32_t numDownsweepThreads; // number of downsweep threads multiples of 32 - based on numElemInBlock
-    uint32_t numDownsweepActiveWarps; // number of warps that should participate
+    // uint32_t numDownsweepActiveWarps; // number of warps that should participate
+    uint32_t downsweepSharedSize; // size of downsweep threads
+    uint32_t downsweepKeysPerThread; // number of keys per thread
 
     uint32_t const numElemInBlock      = 512; // Elements per block
     uint32_t const numUpsweepThreads   = 512; // Num threads per upsweep kernel
     uint32_t const radix = RADIX;
-    uint32_t const downsweepSharedSize = (
-        (512 + ( WARP_SIZE * BIN_KEYS_PER_THREAD ) -1) / ( WARP_SIZE * BIN_KEYS_PER_THREAD ) * RADIX
-    );
+    // uint32_t const downsweepSharedSize = (
+    //     (512 + ( WARP_SIZE * BIN_KEYS_PER_THREAD ) -1) / ( WARP_SIZE * BIN_KEYS_PER_THREAD ) * RADIX
+    // );
 
     static Resources compute(uint32_t size, uint32_t type_size) {
         Resources res;
@@ -171,13 +173,16 @@ struct Resources {
         
         // Calculate part_size based on shared memory constraints
         // res.numElemInBlock = min((uint32_t)available_shared_mem / type_size, size);
-        uint32_t activeDownsweepThreads = ((res.numElemInBlock / BIN_KEYS_PER_THREAD) + LANE_MASK) & ~LANE_MASK;
+        // uint32_t activeDownsweepThreads = ((res.numElemInBlock / BIN_KEYS_PER_THREAD) + LANE_MASK) & ~LANE_MASK;
         // printf("Active downsweep threads: %u\n", activeDownsweepThreads);
 
         res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
         res.numScanThreads  = (res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
-        res.numDownsweepThreads = activeDownsweepThreads;
-        res.numDownsweepActiveWarps = activeDownsweepThreads / WARP_SIZE;
+        res.numDownsweepThreads = 256; // TODO: revisit this
+        res.downsweepKeysPerThread = min(res.numElemInBlock/ res.numDownsweepThreads, BIN_KEYS_PER_THREAD);
+        res.downsweepSharedSize = (res.numElemInBlock + (WARP_SIZE * res.downsweepKeysPerThread) - 1) / ( WARP_SIZE * res.downsweepKeysPerThread ) * RADIX;
+        // res.numDownsweepThreads = activeDownsweepThreads;
+        // res.numDownsweepActiveWarps = activeDownsweepThreads / WARP_SIZE;
 
         return res;
     }
@@ -194,7 +199,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
     uint32_t errors = 0;
 
     Resources res = Resources::compute(size, sizeof(uint32_t));
-    printf("For size[%u]\n---------------\nnumThreadBlocks: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\nmaxNumElementsInBlock: %u\n\n", size, res.numThreadBlocks, res.numUpsweepThreads, res.numScanThreads, res.numDownsweepThreads, res.downsweepSharedSize, res.numElemInBlock);
+    printf("For size[%u]\n---------------\nnumThreadBlocks: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, res.numThreadBlocks, res.numUpsweepThreads, res.numScanThreads, res.numDownsweepThreads, res.downsweepSharedSize, res.downsweepKeysPerThread, res.numElemInBlock);
     
     cudaError_t c_ret;
 
@@ -235,11 +240,11 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
         return errors;
     }
 
-    // for(uint32_t pass=0; pass < numPasses; ++pass) {
-    for(uint32_t pass=0; pass < 1; ++pass) {
+    for(uint32_t pass=0; pass < numPasses; ++pass) {
+    // for(uint32_t pass=0; pass < 1; ++pass) {
         // Run `RadixUpsweep` kernel and validate
         uint32_t shift = pass * 8;
-        printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses, shift);
+        printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses - 1, shift);
 
         {
             // Get current sort data
@@ -250,7 +255,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 printSize<<<1, 1>>>(d_sort);
                 c_ret = cudaGetLastError();
                 if(c_ret) {
-                    printf("Fuck this shit: %s\n",cudaGetErrorString(c_ret));
+                    printf("This shit: %s\n",cudaGetErrorString(c_ret));
                 }
                 errors += 1;
                 break;
@@ -264,11 +269,17 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             }
 
             printf("Sort data now: \n");
-            for(int i=0; i<128; i++) {
+            for(uint32_t i=0; i<32; ++i) {
                 if(std::is_same<T, float>::value)
-                    printf("[%d %f] ", i, sortData[i]);
+                    printf("[%u %f] ", i, sortData[i]);
                 else if(std::is_same<T, uint32_t>::value)
-                    printf("[%d %u] ", i, sortData[i]);
+                    printf("[%u %u] ", i, sortData[i]);
+            }
+            for(uint32_t i=size - 1; i > size - 32; --i) {
+                if(std::is_same<T, float>::value)
+                    printf("[%u %f] ", i, sortData[i]);
+                else if(std::is_same<T, uint32_t>::value)
+                    printf("[%u %u] ", i, sortData[i]);
             }
             printf("\n");
 
@@ -477,8 +488,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
 
         // Finally launch the Downsweep kernel
         {
-            uint32_t sharedSize = res.downsweepSharedSize * sizeof(uint32_t) +
-                res.downsweepSharedSize * sizeof(T);
+            uint32_t sharedSize = res.downsweepSharedSize * sizeof(uint32_t); // For the histogram and later keys
+                // res.downsweepSharedSize * sizeof(T); // A temp storage for the data
 
             // RadixDownsweep<<<res.numThreadBlocks, 256>>>(d_sort, d_sortAlt, d_idx, d_idxAlt, d_globalHist, d_passHist, size, shift);
             RadixDownsweep<T><<<res.numThreadBlocks, res.numDownsweepThreads, sharedSize>>>(
@@ -489,8 +500,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
                 size,
                 shift,
                 res.numElemInBlock,
-                res.downsweepSharedSize
-                // res.numDownsweepActiveWarps
+                res.downsweepSharedSize,
+                res.downsweepKeysPerThread
             );
             c_ret = cudaGetLastError();
             if (c_ret) {
@@ -518,17 +529,25 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
             bool passError = false;
             for(uint32_t i=1; i<size; ++i) {
                 // Basically at every stage target bits[prev] < bits[current]
-                uint32_t prev = sortPass[i - 1] >> shift & RADIX_MASK;
-                uint32_t curr = sortPass[i] >> shift & RADIX_MASK;
+                uint32_t prev = toBitsCpu<T>(sortPass[i - 1]) >> shift & RADIX_MASK;
+                uint32_t curr = toBitsCpu<T>(sortPass[i]) >> shift & RADIX_MASK;
 
                 if(prev > curr) {
-                    if(errors < 32)
-                        printf("Error[%u]@pass[%u]: Prev[%u %u] This[%u %u]\n", i, pass, sortPass[i - 1], prev, sortPass[i], curr);
+                    if(errors < 32) {
+                        printf("Error[%u]@pass[%u]: ", i, pass);
+                        if(std::is_same<T, float>::value)
+                            printf("Prev[%f %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        else if(std::is_same<T, uint32_t>::value)
+                            printf("Prev[%u %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        printf("\n");
+                    }
                     errors += 1;
                     passError = true;
                 }
             }
             printf("Sort data validation after `Downsweep` pass[%u]: %s\n", pass, passError ? "FAIL" : "PASS");
+            
+            free(sortPass);
         }
 
         if(errors > 0) {
@@ -540,6 +559,35 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
         // std::swap(d_idx, d_idxAlt);
     }
 
+    // All passes are done!
+    // let's do a final validation of the sort data
+    T* sorted = (T*)malloc(sortSize);
+    c_ret = cudaMemcpy(sorted, d_sort, sortSize, cudaMemcpyDeviceToHost);
+    if(c_ret) {
+        errors += 1;
+        printf("[Final Validation Data copy] Cuda Error: %s", cudaGetErrorString(c_ret));
+    }
+    cudaDeviceSynchronize();
+
+    printf("Validating final sort data\n");
+    bool isSorted = true;
+    for(uint32_t idx=1; idx<size; ++idx) {
+        if(sorted[idx - 1] > sorted[idx]) {
+            isSorted = false;
+            errors += 1;
+            if(errors < 16) {
+                printf("Unsorted[%u]: ", idx);
+                if(std::is_same<T, float>::value)
+                    printf("Prev[%f] This[%f]", sorted[idx - 1], sorted[idx]);
+                else if(std::is_same<T, uint32_t>::value)
+                    printf("Prev[%u] This[%u]", sorted[idx - 1], sorted[idx]);
+                printf("\n");
+            }
+        }
+    }
+    printf("Final sort validation: `%s`\n", isSorted ? "PASS" : "FAIL");
+    printf("=========================================================\n");
+
     cudaFree(d_sort);
     cudaFree(d_sortAlt);
     cudaFree(d_idx);
@@ -549,16 +597,17 @@ uint32_t validate(const uint32_t size, bool dataseq = true) {
 
     free(h_sort);
     free(h_idx);
+    free(sorted);
     return errors;
 }
 
 int main() {
     const uint32_t N = 13;
-    uint32_t sizes[N] = { 67, 1024, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
+    uint32_t sizes[N] = { 1024, 1120, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    // for(uint32_t i = 0; i < N; i++) {
-    for(uint32_t i = 1; i < 2; i++) {
+    for(uint32_t i = 0; i < N; i++) {
+    // for(uint32_t i = 0; i < 1; i++) {
         {
             printf("`uint32_t`: Upsweep Validation (sequential)\n");
             uint32_t errors = validate<uint32_t>(sizes[i]);
@@ -568,26 +617,26 @@ int main() {
             }
         }
 
-        // {
-        //     printf("`uint32_t`: Upsweep Validation (random)\n");
-        //     uint32_t errors = validate<uint32_t>(sizes[i], false);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
-        // }
+        {
+            printf("`uint32_t`: Upsweep Validation (random)\n");
+            uint32_t errors = validate<uint32_t>(sizes[i], false);
+            if(errors > 0)
+                printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
+        }
 
-        // {
-        //     printf("`float`: Upsweep Validation (sequential)\n");
-        //     uint32_t errors = validateUpsweep<float>(sizes[i]);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
-        // }
+        {
+            printf("`float`: Upsweep Validation (sequential)\n");
+            uint32_t errors = validate<float>(sizes[i]);
+            if(errors > 0)
+                printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+        }
 
-        // {
-        //     printf("`float`: Upsweep Validation (random)\n");
-        //     uint32_t errors = validateUpsweep<float>(sizes[i], false);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
-        // }
+        {
+            printf("`float`: Upsweep Validation (random)\n");
+            uint32_t errors = validate<float>(sizes[i], false);
+            if(errors > 0)
+                printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+        }
 
         // {
         //     printf("`float16`: Upsweep Validation (seequential)\n");
