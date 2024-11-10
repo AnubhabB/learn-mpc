@@ -550,15 +550,16 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             RadixDownsweep<T><<<res.numThreadBlocks, res.numDownsweepThreads, sharedSize>>>(
                 d_sort,
                 d_sortAlt,
-                // d_idx,
-                // d_idxAlt,
+                d_idx,
+                d_idxAlt,
                 d_globalHist,
                 d_passHist,
                 size,
                 shift,
                 res.numElemInBlock,
                 res.downsweepSharedSize,
-                res.downsweepKeysPerThread
+                res.downsweepKeysPerThread,
+                withId
             );
             c_ret = cudaGetLastError();
             if (c_ret) {
@@ -647,10 +648,13 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
     cudaFree(d_sort);
     cudaFree(d_sortAlt);
-    cudaFree(d_idx);
-    cudaFree(d_idxAlt);
     cudaFree(d_globalHist);
     cudaFree(d_passHist);
+
+    if (withId) {
+        cudaFree(d_idx);
+        cudaFree(d_idxAlt);
+    }
 
     free(h_sort);
     free(h_idx);
@@ -663,11 +667,20 @@ int main() {
     uint32_t sizes[N] = { 1024, 1120, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    // for(uint32_t i = 0; i < N; i++) {
-    for(uint32_t i = 0; i < 1; i++) {
+    for(uint32_t i = 0; i < N; i++) {
+    // for(uint32_t i = 0; i < 1; i++) {
         {
             printf("`uint32_t`: Upsweep Validation (sequential)\n");
             uint32_t errors = validate<uint32_t>(sizes[i]);
+            if(errors > 0){
+                printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
+
+        {
+            printf("`uint32_t`: Upsweep Validation (sequential)\n");
+            uint32_t errors = validate<uint32_t>(sizes[i], true, true);
             if(errors > 0){
                 printf("Errors: %u while validating upsweep for size[uint32_t][%u]\n", errors, sizes[i]);
                 break;
@@ -683,12 +696,12 @@ int main() {
             }
         }
 
-        // {
-        //     printf("`float`: Upsweep Validation (sequential)\n");
-        //     uint32_t errors = validate<float>(sizes[i]);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
-        // }
+        {
+            printf("`float`: Upsweep Validation (sequential)\n");
+            uint32_t errors = validate<float>(sizes[i]);
+            if(errors > 0)
+                printf("Errors: %u while validating upsweep for size[float][%u]\n", errors, sizes[i]);
+        }
 
         {
             printf("`float`: Upsweep Validation (random)\n");

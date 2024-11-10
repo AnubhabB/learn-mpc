@@ -13,7 +13,7 @@
 #define RADIX_MASK          (RADIX - 1)     //Mask of digit bins, to extract digits
 #define WARP_INDEX          (threadIdx.x >> LANE_LOG)
 
-#define BIN_KEYS_PER_THREAD 4
+#define BIN_KEYS_PER_THREAD 15
 
 // Thread position within a warp
 __device__ __forceinline__ uint32_t getLaneId() {
@@ -370,15 +370,16 @@ template<typename T>
 __global__ void RadixDownsweep(
     T* keys,                        // Input array
     T* keysAlt,                     // Output array
-    // uint32_t* vals,                 // Optional values to be sorted
-    // uint32_t* valsAlt,              // Output array
+    uint32_t* vals,                 // Optional values to be sorted
+    uint32_t* valsAlt,               // Output array
     const uint32_t* globalHist,     // Global histogram
     const uint32_t* passHist,       // Pass histogram
     const uint32_t size,            // Total elements to sort
     const uint32_t radixShift,      // current radixShift bit
     const uint32_t maxElemInBlock,  // Number of elements processed per partition/ block
     const uint32_t histSize,        // size of the histogram initialized externally
-    const uint32_t numKeysPerThread // real number of keys processed by each thread. Max would be `BIN_KEYS_PER_THREAD`
+    const uint32_t numKeysPerThread,// real number of keys processed by each thread. Max would be `BIN_KEYS_PER_THREAD`
+    const bool sortIndex            // if set to true, attempt to sort the indices
 ) {
     // Shared memory layout
     // `s_tmp` would be used for `s_warpHistograms` and later for `s_keys` and `s_values` (optional)  
@@ -641,7 +642,7 @@ __global__ void RadixDownsweep(
     T* s_keys = reinterpret_cast<T*>(s_tmp);
 
     // scatter keys into shared memory
-    // #pragma unroll BIN_KEYS_PER_THREAD
+    #pragma unroll
     for (uint32_t i = 0; i < numKeysPerThread; ++i) {
         s_keys[offsets[i]] = threadKeys[i];
     }
@@ -660,9 +661,26 @@ __global__ void RadixDownsweep(
         }
     }
 
-    // __syncthreads();
+    __syncthreads();
 
-    // if (vals == nullptr) {
-    //     printf("Mogogofofofofofofo");
-    // }
+    if (!sortIndex) {
+        return;
+    }
+
+    uint32_t* s_vals = reinterpret_cast<uint32_t*>(s_tmp);
+    uint32_t* threadVals = reinterpret_cast<uint32_t*>(threadKeys);
+
+    // Load the indices
+    #pragma unroll
+    for (uint32_t i=0, t=blockOffset + ((numKeysPerThread << LANE_LOG) * WARP_INDEX) + getLaneId(); i<numKeysPerThread;++i, t+=WARP_SIZE) {
+        threadVals[i] = t < size ? keys[t] : getTypeMax<uint32_t>();
+    }
+    __syncthreads();
+
+    // scatter keys into shared memory
+    #pragma unroll
+    for (uint32_t i = 0; i < numKeysPerThread; ++i) {
+        s_vals[offsets[i]] = threadVals[i];
+    }
+    __syncthreads();
 }
