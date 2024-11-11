@@ -82,8 +82,8 @@ __device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val) {
 }
 
 // Helper functions for bit conversions
-template<typename T>
-__device__ inline uint32_t toBits(T val) {
+template<typename T, typename U>
+__device__ inline U toBits(T val) {
     if constexpr (std::is_same<T, float>::value) {
         if (isinf(val)) {
             // Handle infinity
@@ -96,19 +96,19 @@ __device__ inline uint32_t toBits(T val) {
     else if constexpr (std::is_same<T, __half>::value) {
         uint16_t bits = __half_as_ushort(val);
         uint16_t mask = -int(bits >> 15) | 0x8000;
-        return static_cast<uint32_t>(bits ^ mask);
+        return static_cast<U>(bits ^ mask);
     }
     else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
         uint16_t bits = __bfloat16_as_ushort(val);
         uint16_t mask = -int(bits >> 15) | 0x8000;
-        return static_cast<uint32_t>(bits ^ mask);
+        return static_cast<U>(bits ^ mask);
     }
     else if constexpr (std::is_same<T, int64_t>::value) {
         // return static_cast<uint32_t>((val >> radixShift) & 0xFFFFFFFF);
         // TODO - how to handle int64?????
     }
     else {
-        return static_cast<uint32_t>(val);
+        return static_cast<U>(val);
     }
 }
 
@@ -149,9 +149,9 @@ __device__ inline T getTypeMax() {
         return __float2bfloat16(INFINITY);
     } else if constexpr (std::is_same<T, int64_t>::value) {
         return 0x7FFFFFFFFFFFFFFF;
-    } else if constexpr (std::is_same<T, unsigned char>::value) {
+    } else if constexpr (std::is_same<T, uint8_t>::value) {
         return 0xFF; // 255 in hex
-    } else if constexpr (std::is_same<T, u_int32_t>::value) {
+    } else if constexpr (std::is_same<T, uint32_t>::value) {
         return 0xFFFFFFFF;  // 4294967295 in hex
     } else {
         // This seems to be experimental
@@ -167,7 +167,7 @@ __device__ inline T getTypeMax() {
 // passHist - for a particular digit position creates a frequency of values -
 // in this implementaiton a passHist is computer per threadBlock and each threadBlock is responsible for processing `numElementsInBlock`
 // globalHist - converts these frequencies into cumulative counts (prefix sums)
-template<typename T>
+template<typename T, typename U>
 __global__ void RadixUpsweep(
     T* keys,
     uint32_t* globalHist,
@@ -219,7 +219,7 @@ __global__ void RadixUpsweep(
             // }
             #pragma unroll
             for (int j = 0; j < vec_size; ++j) {
-                uint32_t bits = toBits(keys[idx + j]);
+                U bits = toBits<T, U>(keys[idx + j]);
                 // if (blockIdx.x == printBlock) {
                 //     printf("sort[%u %u]: [%u %u %u] ", idx, idx + j, sort[idx + j], bits, bits >> radixShift & RADIX_MASK);
                 // }
@@ -230,7 +230,7 @@ __global__ void RadixUpsweep(
     
     // Process remaining elements
     for (uint32_t i = threadIdx.x + vec_end; i < block_end; i += blockDim.x) {
-        uint32_t bits = toBits(keys[i]);
+        U bits = toBits<T, U>(keys[i]);
         atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
     }
 
@@ -366,7 +366,7 @@ __global__ void RadixScan(
     // }
 }
 
-template<typename T>
+template<typename T, typename U>
 __global__ void RadixDownsweep(
     T* keys,                        // Input array
     T* keysAlt,                     // Output array
@@ -426,7 +426,7 @@ __global__ void RadixDownsweep(
     // Computes warp level histogram for digits
     #pragma unroll
     for (uint32_t i = 0; i < numKeysPerThread; ++i) {
-        uint32_t bitval = toBits<T>(threadKeys[i]);
+        U bitval = toBits<T, U>(threadKeys[i]);
 
         // creating mask for threads in a warp that have same bit value as keys[i]
         unsigned warpFlags = 0xffffffff;
@@ -614,13 +614,13 @@ __global__ void RadixDownsweep(
     if (WARP_INDEX) {
         #pragma unroll
         for (uint32_t i = 0; i < numKeysPerThread; ++i) {
-            const uint32_t t2 = toBits(threadKeys[i]) >> radixShift & RADIX_MASK;
+            const U t2 = toBits<T, U>(threadKeys[i]) >> radixShift & RADIX_MASK;
             offsets[i] += s_warpHist[t2] + s_warpHistograms[t2];
         }
     } else {
         #pragma unroll
         for (uint32_t i = 0; i < numKeysPerThread; ++i)
-            offsets[i] += s_warpHistograms[toBits(threadKeys[i]) >> radixShift & RADIX_MASK];
+            offsets[i] += s_warpHistograms[toBits<T, U>(threadKeys[i]) >> radixShift & RADIX_MASK];
     }
 
     //load in threadblock reductions
@@ -658,7 +658,7 @@ __global__ void RadixDownsweep(
     #pragma unroll
     for(uint32_t i=0, t=threadIdx.x; i<BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
         if (i < numKeysPerThread && t < partSize) {
-            digits[i] = toBits<T>(s_keys[t]) >> radixShift & RADIX_MASK;
+            digits[i] = toBits<T, U>(s_keys[t]) >> radixShift & RADIX_MASK;
             keysAlt[s_localHistogram[digits[i]] + t] = s_keys[t];
         }
     }
