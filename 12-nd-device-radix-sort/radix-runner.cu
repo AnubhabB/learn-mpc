@@ -155,16 +155,13 @@ struct Resources {
     uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
     uint32_t numScanThreads; // number of scan threads to launch should be multiples of 32 (WARP_SIZE) but based on number of blocks
     uint32_t numDownsweepThreads; // number of downsweep threads multiples of 32 - based on numElemInBlock
-    // uint32_t numDownsweepActiveWarps; // number of warps that should participate
     uint32_t downsweepSharedSize; // size of downsweep threads
     uint32_t downsweepKeysPerThread; // number of keys per thread
+    uint32_t numElemInBlock;
 
-    uint32_t const numElemInBlock      = 512; // Elements per block
+    // uint32_t const numElemInBlock      = 512; // Elements per block
     uint32_t const numUpsweepThreads   = 512; // Num threads per upsweep kernel
     uint32_t const radix = RADIX;
-    // uint32_t const downsweepSharedSize = (
-    //     (512 + ( WARP_SIZE * BIN_KEYS_PER_THREAD ) -1) / ( WARP_SIZE * BIN_KEYS_PER_THREAD ) * RADIX
-    // );
 
     static Resources compute(uint32_t size, uint32_t type_size) {
         Resources res;
@@ -175,23 +172,21 @@ struct Resources {
         
         // Calculate shared memory needed for per-block histogram
         // This corresponds to __shared__ uint32_t s_globalHist[RADIX * 2] in the kernel
-        // const uint32_t shared_hist_size = res.radix * 2 * sizeof(uint32_t);
+        const uint32_t shared_hist_size = res.radix * 2 * sizeof(uint32_t);
         
-        // // Calculate available shared memory for data processing
-        // const uint32_t available_shared_mem = ((prop.sharedMemPerBlock - shared_hist_size) * 3) / 4;  // Use ~75% of remaining shared memory
+        // Calculate available shared memory for data processing
+        const uint32_t available_shared_mem = ((prop.sharedMemPerBlock - shared_hist_size) * 3) / 5;  // Use ~60% of remaining shared memory
         
         // Calculate part_size based on shared memory constraints
-        // res.numElemInBlock = min((uint32_t)available_shared_mem / type_size, size);
+        printf("guck: %u\n", min((uint32_t)available_shared_mem / type_size, size));
         // uint32_t activeDownsweepThreads = ((res.numElemInBlock / BIN_KEYS_PER_THREAD) + LANE_MASK) & ~LANE_MASK;
         // printf("Active downsweep threads: %u\n", activeDownsweepThreads);
-
+        res.numElemInBlock  = 512; 
         res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
         res.numScanThreads  = (res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
         res.numDownsweepThreads = 256; // TODO: revisit this
         res.downsweepKeysPerThread = min(res.numElemInBlock/ res.numDownsweepThreads, BIN_KEYS_PER_THREAD);
         res.downsweepSharedSize = (res.numElemInBlock + (WARP_SIZE * res.downsweepKeysPerThread) - 1) / ( WARP_SIZE * res.downsweepKeysPerThread ) * RADIX;
-        // res.numDownsweepThreads = activeDownsweepThreads;
-        // res.numDownsweepActiveWarps = activeDownsweepThreads / WARP_SIZE;
 
         return res;
     }
@@ -542,7 +537,6 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
         // Finally launch the Downsweep kernel
         {
             uint32_t sharedSize = res.downsweepSharedSize * sizeof(uint32_t); // For the histogram and later keys
-                // res.downsweepSharedSize * sizeof(T); // A temp storage for the data
 
             // RadixDownsweep<<<res.numThreadBlocks, 256>>>(d_sort, d_sortAlt, d_idx, d_idxAlt, d_globalHist, d_passHist, size, shift);
             RadixDownsweep<T, U><<<res.numThreadBlocks, res.numDownsweepThreads, sharedSize>>>(

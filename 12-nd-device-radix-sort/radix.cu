@@ -14,7 +14,6 @@
 #define WARP_INDEX          (threadIdx.x >> LANE_LOG)
 
 #define BIN_KEYS_PER_THREAD 15
-
 #define VECTORIZE_SIZE      4               // Number of elements to vectorize
 
 // Thread position within a warp
@@ -438,14 +437,6 @@ __global__ void RadixScan(
             s_scan[(tid & ~LANE_MASK) - 1] : 0) +
             reduction;
     }
-
-    // if (blockIdx.x == 30 && tid == numBlocks - 1) {
-    //     printf("\nDigit[%u]\n", blockIdx.x);
-    //     for (uint32_t i=0; i<blockDim.x; ++i) {
-    //         printf("[%u %u] ", s_scan[i], i < numBlocks ? passHist[digitOffset + i] : 0);
-    //     }
-    //     printf("\n");
-    // }
 }
 
 template<typename T, typename U>
