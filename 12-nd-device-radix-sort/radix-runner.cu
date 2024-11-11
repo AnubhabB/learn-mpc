@@ -46,25 +46,21 @@ inline float random_range(float min, float max) {
     return min + random_float() * (max - min);
 }
 
-#ifdef HALF_FLOAT_SUPPORT
 // Specialization for half float if needed
 template<>
-static inline __fp16 random_range(__fp16 min, __fp16 max) {
+inline half random_range(half min, half max) {
     float min_f = __half2float(min);
     float max_f = __half2float(max);
-    return __float2(min_f + random_float() * (max_f - min_f));
+    return __float2half(min_f + random_float() * (max_f - min_f));
 }
-#endif
 
-#ifdef BRAIN_FLOAT_SUPPORT
 // Specialization for half float if needed
 template<>
-static inline __nv_bfloat16 random_range(__nv_bfloat16 min, __nv_bfloat16 max) {
+inline nv_bfloat16 random_range(nv_bfloat16 min, nv_bfloat16 max) {
     float min_f = __bfloat162float(min);
     float max_f = __bfloat162float(max);
     return __float2bfloat16(min_f + random_float() * (max_f - min_f));
 }
-#endif
 
 template<typename T>
 bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* h_idx, bool seq, bool withId) {
@@ -75,27 +71,23 @@ bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
     T max;
 
     if(!seq) {
-        if(std::is_same<T, uint8_t>::value) {
+        if constexpr (std::is_same<T, uint8_t>::value) {
             min = (uint8_t)0;
             max = (uint8_t)255;
-        } else if(std::is_same<T, uint32_t>::value) {
+        } else if constexpr (std::is_same<T, uint32_t>::value) {
             min = (uint32_t)0;
             max = size <= 1024 ? 64 : (uint32_t)320000;
-        } else if(std::is_same<T, float>::value) {
+        } else if constexpr (std::is_same<T, float>::value) {
             min = -24000.0f;
             max = 24000.0f;
+        } else if constexpr (std::is_same<T, half>::value) {
+            min = -CUDART_MAX_NORMAL_FP16;
+            max = CUDART_MAX_NORMAL_FP16;
+        } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+            min = __float2bfloat16(-6000000.0f);
+            max = __float2bfloat16(6000000.0f);
+            printf("BF16 me! %f %f", __bfloat162float(min), __bfloat162float(max));
         }
-        //  else if(std::is_same<T, __fp16>::value) {
-        //     float mn = -32.0;
-        //     float mx = 128.0f;
-        //     min = __float2half(mn);
-        //     max = __float2half(mx);
-        // } else if(std::is_same<T, __nv_bfloat16>::value) {
-        //     float mn = -64.0;
-        //     float mx = 64.0f;
-        //     min = __float2bfloat16(mn);
-        //     max = __float2bfloat16(mx);
-        // } 
     }
 
     for(uint32_t i=0; i<size; i++) {
@@ -133,22 +125,20 @@ bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
 }
 
 // Helper functions for bit conversions
-template<typename T>
+template<typename T, typename U>
 inline uint32_t toBitsCpu(T val) {
     if constexpr (std::is_same<T, float>::value) {
         uint32_t fuint;
         memcpy(&fuint, &val, sizeof(float));
         return (fuint & 0x80000000) ? ~fuint : fuint ^ 0x80000000;
     }
-    else if constexpr (std::is_same<T, __half>::value) {
+    else if constexpr (std::is_same<T, half>::value) {
         uint16_t bits = __half_as_ushort(val);
-        uint16_t mask = -int(bits >> 15) | 0x8000;
-        return static_cast<uint32_t>(bits ^ mask);
+        return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is sign bit for 16-bit
     }
-    else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+    else if constexpr (std::is_same<T, nv_bfloat16>::value) {
         uint16_t bits = __bfloat16_as_ushort(val);
-        uint16_t mask = -int(bits >> 15) | 0x8000;
-        return static_cast<uint32_t>(bits ^ mask);
+        return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is still the sign bit
     }
     else if constexpr (std::is_same<T, int64_t>::value) {
         // return static_cast<uint32_t>((val >> radixShift) & 0xFFFFFFFF);
@@ -335,20 +325,28 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 break;
             }
 
-            printf("Sort data now: \n");
-            for(uint32_t i=0; i<32; ++i) {
-                if(std::is_same<T, float>::value)
-                    printf("[%u %f] ", i, sortData[i]);
-                else
-                    printf("[%u %u] ", i, sortData[i]);
-            }
-            for(uint32_t i=size - 1; i > size - 32; --i) {
-                if(std::is_same<T, float>::value)
-                    printf("[%u %f] ", i, sortData[i]);
-                else
-                    printf("[%u %u] ", i, sortData[i]);
-            }
-            printf("\n");
+            // printf("Sort data now: \n");
+            // for(uint32_t i=0; i<32; ++i) {
+            //     if constexpr (std::is_same<T, float>::value)
+            //         printf("[%u %f] ", i, sortData[i]);
+            //     else if constexpr (std::is_same<T, half>::value)
+            //         printf("[%u %f] ", i, __half2float(sortData[i]));
+            //     else if constexpr (std::is_same<T, nv_bfloat16>::value)
+            //         printf("[%u %f] ", i, __bfloat162float(sortData[i]));
+            //     else
+            //         printf("[%u %u] ", i, sortData[i]);
+            // }
+            // for(uint32_t i=size - 1; i > size - 32; --i) {
+            //     if constexpr (std::is_same<T, float>::value)
+            //         printf("[%u %f] ", i, sortData[i]);
+            //     else if constexpr (std::is_same<T, half>::value)
+            //         printf("[%u %f] ", i, __half2float(sortData[i]));
+            //     else if constexpr (std::is_same<T, nv_bfloat16>::value)
+            //         printf("[%u %f] ", i, __bfloat162float(sortData[i]));
+            //     else
+            //         printf("[%u %u] ", i, sortData[i]);
+            // }
+            // printf("\n");
 
             RadixUpsweep<T, U><<<res.numThreadBlocks, res.numUpsweepThreads>>>(d_sort, d_globalHist, d_passHist, size, shift, res.numElemInBlock);
             c_ret = cudaGetLastError();
@@ -374,7 +372,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
             // Compute CPU histogram
             for (uint32_t i = 0; i < size; i++) {
-                uint32_t bits = toBitsCpu<T>(sortData[i]);
+                uint32_t bits = toBitsCpu<T, U>(sortData[i]);
                 uint32_t digit = (bits >> shift) & RADIX_MASK;
                 cpuGlobHist[digit]++;
             }
@@ -391,7 +389,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 uint32_t blockend   = min(blockstart + res.numElemInBlock, size);
 
                 for(uint32_t j=blockstart; j < blockend; ++j) {
-                    uint32_t bits = toBitsCpu<T>(sortData[j]);
+                    uint32_t bits = toBitsCpu<T, U>(sortData[j]);
                     bits = ((bits >> shift) & RADIX_MASK);
                     uint32_t trgt = bits * res.numThreadBlocks + i;
                     cpuPassHist[trgt] += 1;
@@ -587,16 +585,22 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             bool passError = false;
             for(uint32_t i=1; i<size; ++i) {
                 // Basically at every stage target bits[prev] < bits[current]
-                uint32_t prev = toBitsCpu<T>(sortPass[i - 1]) >> shift & RADIX_MASK;
-                uint32_t curr = toBitsCpu<T>(sortPass[i]) >> shift & RADIX_MASK;
+                uint32_t prev = toBitsCpu<T, U>(sortPass[i - 1]) >> shift & RADIX_MASK;
+                uint32_t curr = toBitsCpu<T, U>(sortPass[i]) >> shift & RADIX_MASK;
 
                 if(prev > curr) {
                     if(errors < 32) {
                         printf("Error[%u]@pass[%u]: ", i, pass);
-                        if(std::is_same<T, float>::value)
+                        if constexpr (std::is_same<T, float>::value)
                             printf("Prev[%f %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
-                        else
-                            printf("Prev[%u %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        else if constexpr (std::is_same<T, half>::value)
+                            printf("Prev[%f %u] This[%f %u]", __half2float(sortPass[i - 1]), prev, __half2float(sortPass[i]), curr);
+                        else if constexpr (std::is_same<T, nv_bfloat16>::value)
+                            printf("Prev[%f %u] This[%f %u]", __bfloat162float(sortPass[i - 1]), prev, __bfloat162float(sortPass[i]), curr);
+                        else if constexpr (std::is_same<T, uint32_t>::value)
+                            printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        else if constexpr (std::is_same<T, uint8_t>::value)
+                            printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
                         printf("\n");
                     }
                     errors += 1;
@@ -651,8 +655,12 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             errors += 1;
             if(errors < 16) {
                 printf("Unsorted[%u]: ", idx);
-                if(std::is_same<T, float>::value)
+                if constexpr (std::is_same<T, float>::value)
                     printf("Prev[%f] This[%f]", sorted[idx - 1], sorted[idx]);
+                else if constexpr (std::is_same<T, half>::value)
+                    printf("Prev[%f] This[%f]", __half2float(sorted[idx - 1]), __half2float(sorted[idx]));
+                else if constexpr (std::is_same<T, nv_bfloat16>::value)
+                    printf("Prev[%f] This[%f]", __bfloat162float(sorted[idx - 1]), __bfloat162float(sorted[idx]));
                 else
                     printf("Prev[%u] This[%u]", sorted[idx - 1], sorted[idx]);
                 printf("\n");
@@ -784,24 +792,41 @@ int main() {
             }
         }
 
-        // {
-        //     printf("`float16`: Validation (seequential)\n");
-        //     uint32_t errors = validateUpsweep<__fp16>(sizes[i], false);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating for size[fp16][%u]\n", errors, sizes[i]);
-        // }
+        {
+            printf("`float16`: Validation (random)\n");
+            uint32_t errors = validate<half, uint16_t>(sizes[i], false);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[float16][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`float16`: Validation (seequential)\n");
-        //     uint32_t errors = validateUpsweep<__nv_bfloat16>(sizes[i], false);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
-        // }
-        // {
-        //     uint32_t errors = validateUpsweep<half>(sizes[i]);
-        //     if(errors > 0)
-        //         printf("Errors: %u while validating for size[float16][%u]", errors, sizes[i]);
-        // }
+        {
+            printf("`float16`: Validation (random argsort)\n");
+            uint32_t errors = validate<half, uint16_t>(sizes[i], false, true);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[float16][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
+
+        {
+            printf("`bfloat16`: Validation (random)\n");
+            uint32_t errors = validate<nv_bfloat16, uint16_t>(sizes[i], false);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
+
+        {
+            printf("`bfloat16`: Validation (random argsort)\n");
+            uint32_t errors = validate<nv_bfloat16, uint16_t>(sizes[i], false, true);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
     }
     return 0;
 }

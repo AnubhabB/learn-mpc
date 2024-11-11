@@ -85,23 +85,27 @@ __device__ __forceinline__ uint32_t ActiveExclusiveWarpScan(uint32_t val) {
 template<typename T, typename U>
 __device__ inline U toBits(T val) {
     if constexpr (std::is_same<T, float>::value) {
-        if (isinf(val)) {
-            // Handle infinity
-            return val < 0.0f ? 0 : 0xFFFFFFFF;
+        if (isfinite(val)) {
+            uint32_t bits = __float_as_uint(val);
+            return (bits & 0x80000000) ? ~bits : bits ^ 0x80000000;
         }
-        uint32_t bits = __float_as_uint(val);
-        
-        return (bits & 0x80000000) ? ~bits : bits ^ 0x80000000;
-    }
-    else if constexpr (std::is_same<T, __half>::value) {
-        uint16_t bits = __half_as_ushort(val);
-        uint16_t mask = -int(bits >> 15) | 0x8000;
-        return static_cast<U>(bits ^ mask);
+
+        return isnan(val) || val > 0.0f ? 0xFFFFFFFF : 0;
+    } else if constexpr (std::is_same<T, __half>::value) {
+        if (!__hisinf(val)) {  // need to convert to float for isfinite
+            uint16_t bits = __half_as_ushort(val);  // get raw bits of half
+            return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is sign bit for 16-bit
+        }
+
+        return __hisnan(val) || val > CUDART_ZERO_FP16 ? 0xFFFF : 0;
     }
     else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-        uint16_t bits = __bfloat16_as_ushort(val);
-        uint16_t mask = -int(bits >> 15) | 0x8000;
-        return static_cast<U>(bits ^ mask);
+        if (!__hisinf(val)) {  // need to convert to float for isfinite
+            uint16_t bits = __bfloat16_as_ushort(val);
+            return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is still the sign bit
+        }
+
+        return __hisnan(val) || val > CUDART_ZERO_BF16 ? 0xFFFF : 0;
     }
     else if constexpr (std::is_same<T, int64_t>::value) {
         // return static_cast<uint32_t>((val >> radixShift) & 0xFFFFFFFF);
@@ -144,9 +148,9 @@ __device__ inline T getTypeMax() {
     if constexpr (std::is_same<T, float>::value) {
         return INFINITY;
     } else if constexpr (std::is_same<T, __half>::value) {
-        return __float2half(INFINITY);
+        return CUDART_INF_FP16;
     } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-        return __float2bfloat16(INFINITY);
+        return CUDART_INF_BF16;
     } else if constexpr (std::is_same<T, int64_t>::value) {
         return 0x7FFFFFFFFFFFFFFF;
     } else if constexpr (std::is_same<T, uint8_t>::value) {
