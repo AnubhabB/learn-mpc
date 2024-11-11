@@ -392,14 +392,17 @@ __global__ void RadixDownsweep(
 
     // The partition offset of keys to work with
     const uint32_t blockOffset = blockIdx.x * maxElemInBlock;
+    const uint32_t tidInWarp   = ((numKeysPerThread << LANE_LOG) * WARP_INDEX) + getLaneId();
 
     //clear shared memory
     for (uint32_t i = threadIdx.x; i < histSize; i += blockDim.x)
         s_tmp[i] = 0;
 
-    T threadKeys[BIN_KEYS_PER_THREAD];
+    uint32_t threadStore[BIN_KEYS_PER_THREAD]; // local store for max keys per thread to be later used for indices
+    // uint32_t threadVals[BIN_KEYS_PER_THREAD]; // local store for max values per thread. This will remain un-initialized when `!sortIdx`
     uint16_t offsets[BIN_KEYS_PER_THREAD];
 
+    T* threadKeys = reinterpret_cast<T*>(threadStore);
     //load keys
     // We are going to be processing `BIN_KEYS_PER_THREAD` keys per thread
     // The starting location of the each key =
@@ -414,7 +417,7 @@ __global__ void RadixDownsweep(
     // last when scattered. This allows for effortless divergence free sorting
     // of the final partition.
     #pragma unroll
-    for (uint32_t i=0, t=blockOffset + ((numKeysPerThread << LANE_LOG) * WARP_INDEX) + getLaneId(); i<numKeysPerThread;++i, t+=WARP_SIZE) {
+    for (uint32_t i=0, t=blockOffset + tidInWarp; i<numKeysPerThread;++i, t+=WARP_SIZE) {
         threadKeys[i] = t < size ? keys[t] : getTypeMax<T>();
     }
     __syncthreads();
@@ -619,9 +622,9 @@ __global__ void RadixDownsweep(
         for (uint32_t i = 0; i < numKeysPerThread; ++i)
             offsets[i] += s_warpHistograms[toBits(threadKeys[i]) >> radixShift & RADIX_MASK];
     }
-    
 
     //load in threadblock reductions
+    #pragma unroll
     for (uint32_t i=threadIdx.x; i<RADIX; i+=blockDim.x) {
         s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
             passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
@@ -649,31 +652,32 @@ __global__ void RadixDownsweep(
     __syncthreads();
 
     //scatter runs of keys into device memory
-    if (blockIdx.x < gridDim.x - 1) {
-        for (uint32_t i=threadIdx.x; i<maxElemInBlock; i += blockDim.x) {
-            keysAlt[s_localHistogram[toBits<T>(s_keys[i]) >> radixShift & RADIX_MASK] + i] = s_keys[i];
-        }
-    } else {
-        const uint32_t finalPartSize = size - blockOffset;
-        // Last dim might have lesser number of elements
-        for (uint32_t i=threadIdx.x; i<finalPartSize; i += blockDim.x) {
-            keysAlt[s_localHistogram[toBits<T>(s_keys[i]) >> radixShift & RADIX_MASK] + i] = s_keys[i];
-        }
-    }
-
-    __syncthreads();
-
-    if (!sortIndex) {
-        return;
-    }
-
-    uint32_t* s_vals = reinterpret_cast<uint32_t*>(s_tmp);
-    uint32_t* threadVals = reinterpret_cast<uint32_t*>(threadKeys);
-
-    // Load the indices
+    uint8_t digits[BIN_KEYS_PER_THREAD];
+    // if (blockIdx.x < gridDim.x - 1) {
+    uint32_t partSize = size - blockOffset;
     #pragma unroll
-    for (uint32_t i=0, t=blockOffset + ((numKeysPerThread << LANE_LOG) * WARP_INDEX) + getLaneId(); i<numKeysPerThread;++i, t+=WARP_SIZE) {
-        threadVals[i] = t < size ? keys[t] : getTypeMax<uint32_t>();
+    for(uint32_t i=0, t=threadIdx.x; i<BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
+        if (i < numKeysPerThread && t < partSize) {
+            digits[i] = toBits<T>(s_keys[t]) >> radixShift & RADIX_MASK;
+            keysAlt[s_localHistogram[digits[i]] + t] = s_keys[t];
+        }
+    }
+
+    // Now, we are done with the sorting of `keys`
+    // If that's all we need, return
+    if (!sortIndex)
+        return;
+
+    __syncthreads(); // this is required only if we proceed with sorting of indices
+    // `s_tmp` has done with it's job as warp histogram bookkeeper & keys
+    // let's re-use it for our vals
+    uint32_t* s_vals = reinterpret_cast<uint32_t*>(s_tmp);
+    uint32_t* threadVals = reinterpret_cast<uint32_t*>(threadStore);
+
+    // Load indices into registers
+    #pragma unroll
+    for (uint32_t i = 0, t = blockOffset + tidInWarp; i < numKeysPerThread; ++i, t += WARP_SIZE) {
+        threadVals[i] = t < size ? vals[t] : size; // `size` is a placeholder here > max index
     }
     __syncthreads();
 
@@ -683,4 +687,111 @@ __global__ void RadixDownsweep(
         s_vals[offsets[i]] = threadVals[i];
     }
     __syncthreads();
+
+    #pragma unroll
+    for(uint32_t i=0, t=threadIdx.x; i<BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
+        if (i < numKeysPerThread && t < partSize) {
+            valsAlt[s_localHistogram[digits[i]] + t] = s_vals[t];
+        }
+    }
+    // __syncthreads();
+    // #pragma unroll
+    // for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
+    //     i < BIN_KEYS_PER_THREAD;
+    //     ++i, t += LANE_COUNT)
+    // {
+    //     keys[i] = sortPayload[t];
+    // }
+    // } else {
+    //     const uint32_t finalPartSize = size - blockOffset;
+    //     // Last dim might have lesser number of elements
+    //     for (uint32_t i=0, t=threadIdx.x; i<BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
+    //         if (t < finalPartSize) {
+    //             digits[i] = toBits<T>(s_keys[t]) >> radixShift & RADIX_MASK;
+    //             keysAlt[s_localHistogram[digits[i]] + t] = s_keys[t];
+    //         }
+    //     }
+
+    //     __syncthreads();
+    // }
+
+    //scatter runs of keys into device memory
+    // uint8_t digits[BIN_KEYS_PER_THREAD];
+    // if (blockIdx.x < gridDim.x - 1)
+    // {
+    //     //store the digit of key in register
+    //     #pragma unroll
+    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+    //         ++i, t += blockDim.x)
+    //     {
+    //         digits[i] = s_warpHistograms[t] >> radixShift & RADIX_MASK;
+    //         alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+    //     }
+    //     __syncthreads();
+
+    //     //Load payloads into registers
+    //     #pragma unroll
+    //     for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
+    //         i < BIN_KEYS_PER_THREAD;
+    //         ++i, t += LANE_COUNT)
+    //     {
+    //         keys[i] = sortPayload[t];
+    //     }
+
+    //     //scatter payloads into shared memory
+    //     #pragma unroll
+    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+    //         s_warpHistograms[offsets[i]] = keys[i];
+    //     __syncthreads();
+
+    //     //Scatter the payloads into device
+    //     #pragma unroll
+    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+    //         ++i, t += blockDim.x)
+    //     {
+    //         altPayload[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+    //     }
+    // }
+
+    // if (blockIdx.x == gridDim.x - 1)
+    // {
+    //     const uint32_t finalPartSize = size - BIN_PART_START;
+    //     //store the digit of key in register
+    //     #pragma unroll
+    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+    //         ++i, t += blockDim.x)
+    //     {
+    //         if (t < finalPartSize)
+    //         {
+    //             digits[i] = s_warpHistograms[t] >> radixShift & RADIX_MASK;
+    //             alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+    //         }
+    //     }
+    //     __syncthreads();
+
+    //     //Load payloads into registers
+    //     #pragma unroll
+    //     for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
+    //         i < BIN_KEYS_PER_THREAD;
+    //         ++i, t += LANE_COUNT)
+    //     {
+    //         if(t < size)
+    //             keys[i] = sortPayload[t];
+    //     }
+
+    //     //scatter payloads into shared memory
+    //     #pragma unroll
+    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+    //         s_warpHistograms[offsets[i]] = keys[i];
+    //     __syncthreads();
+
+    //     //Scatter the payloads into device
+    //     #pragma unroll
+    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
+    //         ++i, t += blockDim.x)
+    //     {
+    //         if(t < finalPartSize)
+    //             altPayload[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
+    //     }
+    // }
 }
