@@ -531,51 +531,6 @@ __global__ void RadixDownsweep(
     }
     __syncthreads();
 
-    // if (threadIdx.x == 63 && blockIdx.x == 0) {
-    //     printf("\n=== Verification for Thread %u with radixShift[%u] ===\n", threadIdx.x, radixShift);
-    //     for (int i = 0; i < BIN_KEYS_PER_THREAD; i++) {
-    //         printf("Key[%d]: %u -> Offset: %u | (keys[i] >> radixShift) & RADIX_MASK: %u\n", i, keys[i], offsets[i], (keys[i] >> radixShift) & RADIX_MASK);
-            
-    //         // Verify offset is within bounds
-    //         if (offsets[i] >= size) {
-    //             printf("WARNING: Offset %u exceeds size %u\n", offsets[i], size);
-    //         }
-            
-    //         // Verify offset ordering within same radix digit
-    //         if (i > 0 && ((keys[i] >> radixShift & RADIX_MASK) == 
-    //                     (keys[i-1] >> radixShift & RADIX_MASK))) {
-    //             if (offsets[i] <= offsets[i-1]) {
-    //                 printf("WARNING: Non-monotonic offsets for same digit: %u <= %u\n",
-    //                     offsets[i], offsets[i-1]);
-    //             }
-    //         }
-    //     }
-    //     // printf("==== Debug for Thread %u, Key[%d] ====\n", keyIndex);
-    //     // printf("Key Value: %u\n", keys[keyIndex]);
-    //     // printf("Radix Digit: %u\n", keys[keyIndex] >> radixShift & RADIX_MASK);
-    //     // printf("Warp Flags: 0x%08x\n", warpFlags);
-    //     // printf("Bits before current thread: %u\n", bits);
-    //     // printf("Pre-increment value: %u\n", preIncrementVal);
-    //     // printf("Final offset: %u\n", offsets[keyIndex]);
-    //     // printf("================================\n");
-    // }
-    // After initial WLMS (what we saw before)
-    // if (threadIdx.x == 31 && blockIdx.x == 0) {
-    //     printf("\n=== After WLMS ===\n");
-    //     printf("s_warpHistograms[0]: %u\n", s_warpHistograms[0]);
-    //     printf("s_warpHistograms[1]: %u\n", s_warpHistograms[1]);
-    //     printf("s_warpHistograms[2]: %u\n", s_warpHistograms[2]);
-    //     printf("s_warpHistograms[3]: %u\n", s_warpHistograms[3]);
-    //     printf("s_warpHistograms[4]: %u\n", s_warpHistograms[4]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[33]: %u\n", s_warpHistograms[33]);
-    //     printf("s_warpHistograms[34]: %u\n", s_warpHistograms[34]);
-    //     printf("s_warpHistograms[35]: %u\n", s_warpHistograms[35]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[41]: %u\n", s_warpHistograms[41]);
-    //     printf("s_warpHistograms[42]: %u\n", s_warpHistograms[42]);
-    // }
-    // __syncthreads();
     // At this stage we have `warp-level` histograms
     // exclusive prefix sum up the warp histograms
     if (threadIdx.x < RADIX) {
@@ -589,108 +544,18 @@ __global__ void RadixDownsweep(
         s_warpHistograms[threadIdx.x] = InclusiveWarpScanCircularShift(reduction);
     }
     __syncthreads();
-    // uint32_t digitsPerThread = RADIX / blockDim.x  + (RADIX % blockDim.x != 0);
-    // uint32_t startIdx = threadIdx.x * digitsPerThread;
-    // uint32_t endIdx = min(startIdx + digitsPerThread, RADIX);
 
-    // if (startIdx < RADIX) {
-    //     for (uint32_t idx = startIdx; idx < endIdx; ++idx) {
-    //         uint32_t reduction = s_warpHistograms[idx];
-    //         // Process column for this digit
-    //         for (uint32_t i = idx + RADIX; i < histSize; i += RADIX) {
-    //             reduction += s_warpHistograms[i];
-    //             s_warpHistograms[i] = reduction - s_warpHistograms[i];
-    //         }
-            
-    //         // All threads in warp participate in scan
-    //         s_warpHistograms[idx] = InclusiveWarpScanCircularShift(reduction);
-    //     }
-    // }
-    // __syncthreads();
-
-    // if (threadIdx.x == 31 && blockIdx.x == 0) {
-    //     printf("\n=== Before warp boundary update ===\n");
-    //     printf("s_warpHistograms[0]: %u\n", s_warpHistograms[0]);
-    //     printf("s_warpHistograms[1]: %u\n", s_warpHistograms[1]);
-    //     printf("s_warpHistograms[2]: %u\n", s_warpHistograms[2]);
-    //     printf("s_warpHistograms[3]: %u\n", s_warpHistograms[3]);
-    //     printf("s_warpHistograms[4]: %u\n", s_warpHistograms[4]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[33]: %u\n", s_warpHistograms[33]);
-    //     printf("s_warpHistograms[34]: %u\n", s_warpHistograms[34]);
-    //     printf("s_warpHistograms[35]: %u\n", s_warpHistograms[35]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[41]: %u\n", s_warpHistograms[41]);
-    //     printf("s_warpHistograms[42]: %u\n", s_warpHistograms[42]);
-    // }
-    // __syncthreads();
-
-    // if (threadIdx.x == 63 && blockIdx.x == 0) {
-    //     printf("\n=== Verification for Thread %u with radixShift[%u] After Exclusive prefix sum ===\n", threadIdx.x, radixShift);
-    //     for (uint32_t i = 0; i < RADIX; ++i) {
-    //         printf("[%u %u] ", i, s_warpHistograms[i]);
-    //     }
-    //     printf("\n\n");
-    // }
-    
     // Update the first threads of warps
     if (threadIdx.x < (RADIX >> LANE_LOG)) {
         uint32_t val = s_warpHistograms[threadIdx.x << LANE_LOG];
-        uint32_t result = ActiveExclusiveWarpScan(val);
-        //  if (blockIdx.x == 0) {
-        //     printf("Thread %d: Index %d, Input %u, Output %u\n", 
-        //         threadIdx.x, threadIdx.x << LANE_LOG, val, result);
-        // }
-        s_warpHistograms[threadIdx.x << LANE_LOG] = result;
+        s_warpHistograms[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(val);
 
     }
     __syncthreads();
-    // After first phase (warp boundary update)
-    // if (threadIdx.x == 31 && blockIdx.x == 0) {
-    //     printf("\n=== After Warp Boundary Update ===\n");
-    //     printf("s_warpHistograms[0]: %u\n", s_warpHistograms[0]);
-    //     printf("s_warpHistograms[1]: %u\n", s_warpHistograms[1]);
-    //     printf("s_warpHistograms[2]: %u\n", s_warpHistograms[2]);
-    //     printf("s_warpHistograms[3]: %u\n", s_warpHistograms[3]);
-    //     printf("s_warpHistograms[4]: %u\n", s_warpHistograms[4]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[33]: %u\n", s_warpHistograms[33]);
-    //     printf("s_warpHistograms[34]: %u\n", s_warpHistograms[34]);
-    //     printf("s_warpHistograms[35]: %u\n", s_warpHistograms[35]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[41]: %u\n", s_warpHistograms[41]);
-    //     printf("s_warpHistograms[42]: %u\n", s_warpHistograms[42]);
-    // }
-    // __syncthreads();
 
     if (threadIdx.x < RADIX && getLaneId())
         s_warpHistograms[threadIdx.x] += __shfl_sync(0xfffffffe, s_warpHistograms[threadIdx.x - 1], 1);
     __syncthreads();
-
-    // After propagation phase
-    // if (threadIdx.x == 31 && blockIdx.x == 0) {
-    //     printf("\n=== After Propagation ===\n");
-    //     printf("s_warpHistograms[0]: %u\n", s_warpHistograms[0]);
-    //     printf("s_warpHistograms[1]: %u\n", s_warpHistograms[1]);
-    //     printf("s_warpHistograms[2]: %u\n", s_warpHistograms[2]);
-    //     printf("s_warpHistograms[3]: %u\n", s_warpHistograms[3]);
-    //     printf("s_warpHistograms[4]: %u\n", s_warpHistograms[4]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[33]: %u\n", s_warpHistograms[33]);
-    //     printf("s_warpHistograms[34]: %u\n", s_warpHistograms[34]);
-    //     printf("s_warpHistograms[35]: %u\n", s_warpHistograms[35]);
-    //     printf(" ... \n");
-    //     printf("s_warpHistograms[41]: %u\n", s_warpHistograms[41]);
-    //     printf("s_warpHistograms[42]: %u\n", s_warpHistograms[42]);
-    // }
-    // __syncthreads();
-    // if (threadIdx.x == 63 && blockIdx.x == 0) {
-    //     printf("\n=== Verification for Thread %u with radixShift[%u] After Exclusive prefix sum ===\n", threadIdx.x, radixShift);
-    //     for (uint32_t i = 0; i < RADIX; ++i) {
-    //         printf("[%u %u] ", i, s_warpHistograms[i]);
-    //     }
-    //     printf("\n\n");
-    // }
 
     //update offsets
     if (WARP_INDEX) {
@@ -712,15 +577,6 @@ __global__ void RadixDownsweep(
             passHist[i * gridDim.x + blockIdx.x] - s_warpHistograms[i];
     }
     __syncthreads();
-
-    // if (blockIdx.x == 0 && threadIdx.x == blockDim.x - 1) {
-    //     printf("Block level histogram: ============================\n");
-    //     for (uint32_t i=0; i<RADIX/2; ++i) {
-    //         // printf("[%u %u %u %u %u] ", i, s_localHistogram[i], globalHist[i], passHist[i * gridDim.x], passHist[i * gridDim.x + 1]);
-    //         printf("Digit %u globalHist: %u passHists: [%u %u] s_warpHistogram: %u s_localHistogram: %u\n", i, globalHist[i], passHist[i * gridDim.x], passHist[i * gridDim.x + 1], s_warpHistograms[i], s_localHistogram[i]);
-    //     }
-    //     printf("\n=================================================\n");
-    // }
 
     // `s_tmp` has done with it's job as warp histogram bookkeeper
     // let's re-use it for our keys
@@ -776,104 +632,4 @@ __global__ void RadixDownsweep(
             valsAlt[s_localHistogram[digits[i]] + t] = s_vals[t];
         }
     }
-    // __syncthreads();
-    // #pragma unroll
-    // for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
-    //     i < BIN_KEYS_PER_THREAD;
-    //     ++i, t += LANE_COUNT)
-    // {
-    //     keys[i] = sortPayload[t];
-    // }
-    // } else {
-    //     const uint32_t finalPartSize = size - blockOffset;
-    //     // Last dim might have lesser number of elements
-    //     for (uint32_t i=0, t=threadIdx.x; i<BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {
-    //         if (t < finalPartSize) {
-    //             digits[i] = toBits<T>(s_keys[t]) >> radixShift & RADIX_MASK;
-    //             keysAlt[s_localHistogram[digits[i]] + t] = s_keys[t];
-    //         }
-    //     }
-
-    //     __syncthreads();
-    // }
-
-    //scatter runs of keys into device memory
-    // uint8_t digits[BIN_KEYS_PER_THREAD];
-    // if (blockIdx.x < gridDim.x - 1)
-    // {
-    //     //store the digit of key in register
-    //     #pragma unroll
-    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
-    //         ++i, t += blockDim.x)
-    //     {
-    //         digits[i] = s_warpHistograms[t] >> radixShift & RADIX_MASK;
-    //         alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
-    //     }
-    //     __syncthreads();
-
-    //     //Load payloads into registers
-    //     #pragma unroll
-    //     for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
-    //         i < BIN_KEYS_PER_THREAD;
-    //         ++i, t += LANE_COUNT)
-    //     {
-    //         keys[i] = sortPayload[t];
-    //     }
-
-    //     //scatter payloads into shared memory
-    //     #pragma unroll
-    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-    //         s_warpHistograms[offsets[i]] = keys[i];
-    //     __syncthreads();
-
-    //     //Scatter the payloads into device
-    //     #pragma unroll
-    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
-    //         ++i, t += blockDim.x)
-    //     {
-    //         altPayload[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
-    //     }
-    // }
-
-    // if (blockIdx.x == gridDim.x - 1)
-    // {
-    //     const uint32_t finalPartSize = size - BIN_PART_START;
-    //     //store the digit of key in register
-    //     #pragma unroll
-    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
-    //         ++i, t += blockDim.x)
-    //     {
-    //         if (t < finalPartSize)
-    //         {
-    //             digits[i] = s_warpHistograms[t] >> radixShift & RADIX_MASK;
-    //             alt[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
-    //         }
-    //     }
-    //     __syncthreads();
-
-    //     //Load payloads into registers
-    //     #pragma unroll
-    //     for (uint32_t i = 0, t = getLaneId() + BIN_SUB_PART_START + BIN_PART_START;
-    //         i < BIN_KEYS_PER_THREAD;
-    //         ++i, t += LANE_COUNT)
-    //     {
-    //         if(t < size)
-    //             keys[i] = sortPayload[t];
-    //     }
-
-    //     //scatter payloads into shared memory
-    //     #pragma unroll
-    //     for (uint32_t i = 0; i < BIN_KEYS_PER_THREAD; ++i)
-    //         s_warpHistograms[offsets[i]] = keys[i];
-    //     __syncthreads();
-
-    //     //Scatter the payloads into device
-    //     #pragma unroll
-    //     for (uint32_t i = 0, t = threadIdx.x; i < BIN_KEYS_PER_THREAD;
-    //         ++i, t += blockDim.x)
-    //     {
-    //         if(t < finalPartSize)
-    //             altPayload[s_localHistogram[digits[i]] + t] = s_warpHistograms[t];
-    //     }
-    // }
 }
