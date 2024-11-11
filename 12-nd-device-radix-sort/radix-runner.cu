@@ -133,11 +133,11 @@ inline uint32_t toBitsCpu(T val) {
         return (fuint & 0x80000000) ? ~fuint : fuint ^ 0x80000000;
     }
     else if constexpr (std::is_same<T, half>::value) {
-        uint16_t bits = __half_as_ushort(val);
+        ushort bits = __half_as_ushort(val);
         return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is sign bit for 16-bit
     }
     else if constexpr (std::is_same<T, nv_bfloat16>::value) {
-        uint16_t bits = __bfloat16_as_ushort(val);
+        ushort bits = __bfloat16_as_ushort(val);
         return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is still the sign bit
     }
     else if constexpr (std::is_same<T, int64_t>::value) {
@@ -794,7 +794,7 @@ int main() {
 
         {
             printf("`float16`: Validation (random)\n");
-            uint32_t errors = validate<half, uint16_t>(sizes[i], false);
+            uint32_t errors = validate<half, ushort>(sizes[i], false);
             if(errors > 0) {
                 printf("Errors: %u while validating for size[float16][%u]\n", errors, sizes[i]);
                 break;
@@ -803,7 +803,7 @@ int main() {
 
         {
             printf("`float16`: Validation (random argsort)\n");
-            uint32_t errors = validate<half, uint16_t>(sizes[i], false, true);
+            uint32_t errors = validate<half, ushort>(sizes[i], false, true);
             if(errors > 0) {
                 printf("Errors: %u while validating for size[float16][%u]\n", errors, sizes[i]);
                 break;
@@ -812,7 +812,7 @@ int main() {
 
         {
             printf("`bfloat16`: Validation (random)\n");
-            uint32_t errors = validate<nv_bfloat16, uint16_t>(sizes[i], false);
+            uint32_t errors = validate<nv_bfloat16, ushort>(sizes[i], false);
             if(errors > 0) {
                 printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
                 break;
@@ -821,7 +821,7 @@ int main() {
 
         {
             printf("`bfloat16`: Validation (random argsort)\n");
-            uint32_t errors = validate<nv_bfloat16, uint16_t>(sizes[i], false, true);
+            uint32_t errors = validate<nv_bfloat16, ushort>(sizes[i], false, true);
             if(errors > 0) {
                 printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
                 break;

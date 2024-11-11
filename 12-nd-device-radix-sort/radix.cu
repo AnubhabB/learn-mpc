@@ -15,6 +15,8 @@
 
 #define BIN_KEYS_PER_THREAD 15
 
+#define VECTORIZE_SIZE      4               // Number of elements to vectorize
+
 // Thread position within a warp
 __device__ __forceinline__ uint32_t getLaneId() {
     uint32_t laneId;
@@ -118,28 +120,144 @@ __device__ inline U toBits(T val) {
 
 // Vector type mappings
 template<typename T> struct VectorTrait {
-    // Default case (32-bit types)
-    static constexpr uint32_t vector_size = 4;  // 4 * 4 bytes = 16 bytes
-    static constexpr uint32_t bytes_per_vector = sizeof(T) * vector_size;
+    static constexpr uint32_t vector_size = 4;
 };
 
 // Vectorizations for different types
+// Specialization for 8-bit types
+template<>
+struct VectorTrait<uint8_t> {
+    static constexpr uint32_t vector_size = 4;
+};
+
+// For half and nv_bfloat16
 template<>
 struct VectorTrait<half> {
-    static constexpr uint32_t vector_size = 8;  // 8 * 2 bytes = 16 bytes
-    // using type = float4;
+    static constexpr uint32_t vector_size = 2;
 };
 
 template<>
 struct VectorTrait<nv_bfloat16> {
-    static constexpr uint32_t vector_size = 8;   // 8 * 2 bytes = 16 bytes
+    static constexpr uint32_t vector_size = 2;
 };
 
-// Specialization for 8-bit types
+// for float
 template<>
-struct VectorTrait<uint8_t> {
-    static constexpr uint32_t vector_size = 16;  // 16 * 1 byte = 16 bytes
+struct VectorTrait<float> {
+    static constexpr uint32_t vector_size = 4;
 };
+
+// Unified container that always stores the converted type U
+template<typename U>
+struct Vectorized {
+    U x, y, z, w;
+};
+
+// Base declaration with both input type T and output type U
+template<typename T, typename U>
+struct VectorLoad {
+    __device__ static Vectorized<U> load(const T* data, uint32_t idx);
+};
+
+// Specialization for uint32_t
+template<>
+struct VectorLoad<uint32_t, uint32_t> {
+    __device__ static Vectorized<uint32_t> load(const uint32_t* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const uint32_t* aligned_ptr = data + idx;
+        // Do vectorized load
+        uint4 vec = *reinterpret_cast<const uint4*>(aligned_ptr);
+        
+        return Vectorized<uint32_t>{
+            toBits<uint32_t, uint32_t>(vec.x),
+            toBits<uint32_t, uint32_t>(vec.y),
+            toBits<uint32_t, uint32_t>(vec.z),
+            toBits<uint32_t, uint32_t>(vec.w)
+        };
+    }
+};
+
+// Specialization for float
+template<>
+struct VectorLoad<float, uint32_t> {
+    __device__ static Vectorized<uint32_t> load(const float* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const float* aligned_ptr = data + idx;
+        // Do vectorized load
+        float4 vec = *reinterpret_cast<const float4*>(aligned_ptr);
+        // float4 vec = reinterpret_cast<const float4*>(data)[idx];
+        return Vectorized<uint32_t>{
+            toBits<float, uint32_t>(vec.x),
+            toBits<float, uint32_t>(vec.y),
+            toBits<float, uint32_t>(vec.z),
+            toBits<float, uint32_t>(vec.w)
+        };
+    }
+};
+
+// Specialization for half - does two half2 loads
+template<>
+struct VectorLoad<half, uint16_t> {
+    __device__ static Vectorized<uint16_t> load(const half* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const half* aligned_ptr = data + idx;
+        
+        // Load first two elements using half2
+        half2 vec1 = *reinterpret_cast<const half2*>(aligned_ptr);
+        // Load next two elements using half2
+        half2 vec2 = *reinterpret_cast<const half2*>(aligned_ptr + 2);
+
+        return Vectorized<uint16_t>{
+            toBits<half, uint16_t>(vec1.x),
+            toBits<half, uint16_t>(vec1.y),
+            toBits<half, uint16_t>(vec2.x),
+            toBits<half, uint16_t>(vec2.y)
+        };
+    }
+};
+
+// Specialization for bfloat16 - does two bfloat162 loads
+template<>
+struct VectorLoad<nv_bfloat16, uint16_t> {
+    __device__ static Vectorized<uint16_t> load(const nv_bfloat16* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const nv_bfloat16* aligned_ptr = data + idx;
+        
+        // Load first two elements using nv_bfloat162
+        nv_bfloat162 vec1 = *reinterpret_cast<const nv_bfloat162*>(aligned_ptr);
+        // Load next two elements using nv_bfloat162
+        nv_bfloat162 vec2 = *reinterpret_cast<const nv_bfloat162*>(aligned_ptr + 2);
+
+        return Vectorized<uint16_t>{
+            toBits<nv_bfloat16, uint16_t>(vec1.x),
+            toBits<nv_bfloat16, uint16_t>(vec1.y),
+            toBits<nv_bfloat16, uint16_t>(vec2.x),
+            toBits<nv_bfloat16, uint16_t>(vec2.y)
+        };
+    }
+};
+
+template<>
+struct VectorLoad<uint8_t, uint8_t> {
+    __device__ static Vectorized<uint8_t> load(const uint8_t* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const uint8_t* aligned_ptr = data + idx;
+        uchar4 vec = *reinterpret_cast<const uchar4*>(aligned_ptr);
+
+        return Vectorized<uint8_t>{
+            toBits<uint8_t, uint8_t>(vec.x),
+            toBits<uint8_t, uint8_t>(vec.y),
+            toBits<uint8_t, uint8_t>(vec.z),
+            toBits<uint8_t, uint8_t>(vec.w)
+        };
+    }
+};
+
+// Helper function
+template<typename T, typename U>
+__device__ __forceinline__ Vectorized<U> load_vector(const T* data, uint32_t idx) {
+    return VectorLoad<T, U>::load(data, idx);
+}
 
 
 // Helper function to get type-specific maximum value
@@ -196,39 +314,21 @@ __global__ void RadixUpsweep(
     const uint32_t block_end = min(block_start + maxElemInBlock, size);
     const uint32_t elements_in_block = block_end - block_start;
 
-    // if (blockIdx.x == printBlock && (threadIdx.x == 0 || threadIdx.x == 15)) {
-    //     printf("Thread[%u]: maxElemInBlock[%u] block_start[%u] block_end[%u] elements_in_block[%u]\n", threadIdx.x, maxElemInBlock, block_start, block_end, elements_in_block);
-    // }
-
-    // if (threadIdx.x == 0 && blockIdx.x == printBlock) {
-    //     // printf("\nBlock[%u]: ", blockIdx.x);
-    //     for (uint32_t i=block_start; i<block_end; ++i) {
-    //         printf("%u ", i]);
-    //     }
-    //     printf("--\n");
-    // }
-    // Vector load based on types
-    constexpr uint32_t vec_size = VectorTrait<T>::vector_size;
 
     // Calculate number of full vectors - we are going to make an attempt to process
-    const uint32_t full_vecs = elements_in_block / vec_size;
-    const uint32_t vec_end = block_start + (full_vecs * vec_size);
+    const uint32_t full_vecs = elements_in_block / VECTORIZE_SIZE;
+    const uint32_t vec_end = block_start + (full_vecs * VECTORIZE_SIZE);
     
     for (uint32_t i = threadIdx.x; i < full_vecs; i += blockDim.x) {
-        const uint32_t idx = block_start + i * vec_size;
+        const uint32_t idx = block_start + i * VECTORIZE_SIZE;
         
         if (idx < vec_end) {
-            // if (blockIdx.x == printBlock) {
-            //     printf("Idx[%u] ", idx);
-            // }
-            #pragma unroll
-            for (int j = 0; j < vec_size; ++j) {
-                U bits = toBits<T, U>(keys[idx + j]);
-                // if (blockIdx.x == printBlock) {
-                //     printf("sort[%u %u]: [%u %u %u] ", idx, idx + j, sort[idx + j], bits, bits >> radixShift & RADIX_MASK);
-                // }
-                atomicAdd(&s_globalHist[bits >> radixShift & RADIX_MASK], 1);
-            }
+            Vectorized<U> data = load_vector<T, U>(keys, idx);
+
+            atomicAdd(&s_globalHist[data.x >> radixShift & RADIX_MASK], 1);
+            atomicAdd(&s_globalHist[data.y >> radixShift & RADIX_MASK], 1);
+            atomicAdd(&s_globalHist[data.z >> radixShift & RADIX_MASK], 1);
+            atomicAdd(&s_globalHist[data.w >> radixShift & RADIX_MASK], 1);
         }
     }
     
@@ -250,26 +350,12 @@ __global__ void RadixUpsweep(
         s_globalHist[i] = InclusiveWarpScanCircularShift(s_globalHist[i]);
     }
     __syncthreads();
-    // if (threadIdx.x == 15 && blockIdx.x == printBlock) {
-    //     printf("\nBlockHist[%u]: ", blockIdx.x);
-    //     for (uint32_t i=0; i<RADIX; ++i) {
-    //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
-    //     }
-    //     printf("--\n");
-    // }
 
     // Perform warp-level scan - for first thread in each warp
     if (threadIdx.x < (RADIX >> LANE_LOG))
         s_globalHist[threadIdx.x << LANE_LOG] = ActiveExclusiveWarpScan(s_globalHist[threadIdx.x << LANE_LOG]);
     __syncthreads();
-
-    // if (threadIdx.x == 15 && blockIdx.x == printBlock) {
-    //     printf("\nBlockHist[%u]: ", blockIdx.x);
-    //     for (uint32_t i=0; i<RADIX; ++i) {
-    //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
-    //     }
-    //     printf("--\n");
-    // }
+    
     // Update global histogram with prefix sum results
     for (uint32_t i = threadIdx.x; i < RADIX; i += blockDim.x) {
         atomicAdd(
@@ -279,14 +365,6 @@ __global__ void RadixUpsweep(
                 __shfl_sync(0xfffffffe, s_globalHist[i - 1], 1) : 0)
         );
     }
-
-    // if (threadIdx.x == 15 && blockIdx.x == printBlock) {
-    //     printf("\nBlockHist[%u]: ", blockIdx.x);
-    //     for (uint32_t i=0; i<RADIX; ++i) {
-    //         printf("[%u %u %u]\n", i, passHist[RADIX * blockIdx.x + i], s_globalHist[i]);
-    //     }
-    //     printf("--\n");
-    // }
 }
 
 
