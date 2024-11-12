@@ -202,10 +202,6 @@ struct Resources {
     }
 };
 
-template<typename T>
-__global__ void printSize(T* d) {
-    printf("Size: %lu", sizeof(d));
-}
 
 template<typename T, typename U>
 uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false) {
@@ -314,7 +310,6 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             c_ret = cudaMemcpy(sortData, d_sort, sortSize, cudaMemcpyDeviceToHost);
             if (c_ret) {
                 printf("[Before Upsweep -> cudaMemcpy] Cuda Error: %s\n", cudaGetErrorString(c_ret));
-                printSize<<<1, 1>>>(d_sort);
                 c_ret = cudaGetLastError();
                 if(c_ret) {
                     printf("This shit: %s\n",cudaGetErrorString(c_ret));
