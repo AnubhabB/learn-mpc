@@ -88,63 +88,31 @@ __device__ inline U toBits(T val) {
     if constexpr (std::is_same<T, float>::value) {
         if (isfinite(val)) {
             uint32_t bits = __float_as_uint(val);
-            return (bits & 0x80000000) ? ~bits : bits ^ 0x80000000;
+            return static_cast<U>((bits & 0x80000000) ? ~bits : bits ^ 0x80000000);
         }
 
         return isnan(val) || val > 0.0f ? 0xFFFFFFFF : 0;
     } else if constexpr (std::is_same<T, __half>::value) {
         if (!__hisinf(val)) {  // need to convert to float for isfinite
             uint16_t bits = __half_as_ushort(val);  // get raw bits of half
-            return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is sign bit for 16-bit
+            return static_cast<U>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
         }
 
         return __hisnan(val) || val > CUDART_ZERO_FP16 ? 0xFFFF : 0;
-    }
-    else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+    } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
         if (!__hisinf(val)) {  // need to convert to float for isfinite
             uint16_t bits = __bfloat16_as_ushort(val);
-            return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is still the sign bit
+            return static_cast<U>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is still the sign bit
         }
 
         return __hisnan(val) || val > CUDART_ZERO_BF16 ? 0xFFFF : 0;
-    }
-    else if constexpr (std::is_same<T, int64_t>::value) {
-        // return static_cast<uint32_t>((val >> radixShift) & 0xFFFFFFFF);
-        // TODO - how to handle int64?????
-    }
-    else {
+    // } else if constexpr (std::is_same<T, int64_t>::value) {
+    //     return static_cast<U>(val) ^ 0x8000000000000000;
+    } else {
+        // Should be unreachable!
         return static_cast<U>(val);
     }
 }
-
-// Vector type mappings
-template<typename T> struct VectorTrait {
-    static constexpr uint32_t vector_size = 4;
-};
-
-// Vectorizations for different types
-// Specialization for 8-bit types
-template<>
-struct VectorTrait<uint8_t> {
-    static constexpr uint32_t vector_size = 4;
-};
-
-// For half and nv_bfloat16
-template<>
-struct VectorTrait<half> {
-    static constexpr uint32_t vector_size = 2;
-};
-
-template<>
-struct VectorTrait<nv_bfloat16> {
-    static constexpr uint32_t vector_size = 2;
-};
-
-// for float
-template<>
-struct VectorTrait<float> {
-    static constexpr uint32_t vector_size = 4;
-};
 
 // Unified container that always stores the converted type U
 template<typename U>
@@ -153,10 +121,29 @@ struct Vectorized {
 };
 
 // Base declaration with both input type T and output type U
+// Output `U` translates to the type required to represent the input `T` as bits
 template<typename T, typename U>
 struct VectorLoad {
     __device__ static Vectorized<U> load(const T* data, uint32_t idx);
 };
+
+// Specialization for int64_t
+// template<>
+// struct VectorLoad<int64_t, uint64_t> {
+//     __device__ static Vectorized<uint64_t> load(const int64_t* data, uint32_t idx) {
+//         // Create aligned pointer to starting address
+//         const int64_t* aligned_ptr = data + idx;
+//         // Do vectorized load
+//         ulong4 vec = *reinterpret_cast<const ulong4*>(aligned_ptr);
+        
+//         return Vectorized<uint64_t>{
+//             toBits<int64_t, uint64_t>(vec.x),
+//             toBits<int64_t, uint64_t>(vec.y),
+//             toBits<int64_t, uint64_t>(vec.z),
+//             toBits<int64_t, uint64_t>(vec.w)
+//         };
+//     }
+// };
 
 // Specialization for uint32_t
 template<>
@@ -236,6 +223,7 @@ struct VectorLoad<nv_bfloat16, uint16_t> {
     }
 };
 
+// Specialization for uint8_t
 template<>
 struct VectorLoad<uint8_t, uint8_t> {
     __device__ static Vectorized<uint8_t> load(const uint8_t* data, uint32_t idx) {
@@ -252,7 +240,7 @@ struct VectorLoad<uint8_t, uint8_t> {
     }
 };
 
-// Helper function
+// Helper function for vectorized load of data
 template<typename T, typename U>
 __device__ __forceinline__ Vectorized<U> load_vector(const T* data, uint32_t idx) {
     return VectorLoad<T, U>::load(data, idx);
@@ -262,23 +250,20 @@ __device__ __forceinline__ Vectorized<U> load_vector(const T* data, uint32_t idx
 // Helper function to get type-specific maximum value
 template<typename T>
 __device__ inline T getTypeMax() {
-    if constexpr (std::is_same<T, float>::value) {
-        return INFINITY;
-    } else if constexpr (std::is_same<T, __half>::value) {
-        return CUDART_INF_FP16;
-    } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
-        return CUDART_INF_BF16;
-    } else if constexpr (std::is_same<T, int64_t>::value) {
-        return 0x7FFFFFFFFFFFFFFF;
-    } else if constexpr (std::is_same<T, uint8_t>::value) {
+    if constexpr (std::is_same<T, uint8_t>::value) {
         return 0xFF; // 255 in hex
+    } else if constexpr (std::is_same<T, half>::value) {
+        return CUDART_INF_FP16;
+    } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+        return CUDART_INF_BF16;
+    } else if constexpr (std::is_same<T, float>::value) {
+        return INFINITY;
     } else if constexpr (std::is_same<T, uint32_t>::value) {
         return 0xFFFFFFFF;  // 4294967295 in hex
+    // } else if constexpr (std::is_same<T, int64_t>::value) {
+    //     return 0x7FFFFFFFFFFFFFFF;
     } else {
-        // This seems to be experimental
-        // calling a constexpr __host__ function("max") from a __device__ function("getTypeMax") is not allowed. The experimental flag '--expt-relaxed-constexpr' can be used to allow this.
-        
-        // Shouldn't reach here
+        // Should be unreachable
         return static_cast<T>(-1);
     }
 }
@@ -470,9 +455,8 @@ __global__ void RadixDownsweep(
     //clear shared memory
     for (uint32_t i = threadIdx.x; i < histSize; i += blockDim.x)
         s_tmp[i] = 0;
-
+    
     uint32_t threadStore[BIN_KEYS_PER_THREAD]; // local store for max keys per thread to be later used for indices
-    // uint32_t threadVals[BIN_KEYS_PER_THREAD]; // local store for max values per thread. This will remain un-initialized when `!sortIdx`
     uint16_t offsets[BIN_KEYS_PER_THREAD];
 
     T* threadKeys = reinterpret_cast<T*>(threadStore);
