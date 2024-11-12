@@ -86,7 +86,6 @@ bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, T* h_sort, uint32_t* 
         } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
             min = __float2bfloat16(-6000000.0f);
             max = __float2bfloat16(6000000.0f);
-            printf("BF16 me! %f %f", __bfloat162float(min), __bfloat162float(max));
         }
     }
 
@@ -152,15 +151,14 @@ inline uint32_t toBitsCpu(T val) {
 // Calculate resources to run
 struct Resources {
     // uint32_t numVecElemInBlock; // Vector elements per block
-    uint32_t numThreadBlocks; // number of threadblocks to run for Upsweep and DownsweepPairs kernel
+    uint32_t numThreadBlocks;   // number of threadblocks to run for Upsweep and DownsweepPairs kernel
+    uint32_t numUpsweepThreads; // number of upsweep threads required to sort. ceil(size / numThreadBlocks) as multiples of 32
     uint32_t numScanThreads; // number of scan threads to launch should be multiples of 32 (WARP_SIZE) but based on number of blocks
-    uint32_t numDownsweepThreads; // number of downsweep threads multiples of 32 - based on numElemInBlock
     uint32_t downsweepSharedSize; // size of downsweep threads
     uint32_t downsweepKeysPerThread; // number of keys per thread
     uint32_t numElemInBlock;
 
-    // uint32_t const numElemInBlock      = 512; // Elements per block
-    uint32_t const numUpsweepThreads   = 512; // Num threads per upsweep kernel
+    uint32_t const numDownsweepThreads = 512; // number of downsweep threads multiples of 32 - based on numElemInBlock
     uint32_t const radix = RADIX;
 
     static Resources compute(uint32_t size, uint32_t type_size) {
@@ -172,19 +170,23 @@ struct Resources {
         
         // Calculate shared memory needed for per-block histogram
         // This corresponds to __shared__ uint32_t s_globalHist[RADIX * 2] in the kernel
-        const uint32_t shared_hist_size = res.radix * 2 * sizeof(uint32_t);
+        const uint32_t shared_hist_size_upsweep = res.radix * 2 * sizeof(uint32_t);
         
         // Calculate available shared memory for data processing
-        const uint32_t available_shared_mem = ((prop.sharedMemPerBlock - shared_hist_size) * 3) / 5;  // Use ~60% of remaining shared memory
-        
+        const uint32_t available_shared_mem_upsweep = ((prop.sharedMemPerBlock - shared_hist_size_upsweep) * 3) / 5;  // Use ~60% of remaining shared memory
+
         // Calculate part_size based on shared memory constraints
-        printf("guck: %u\n", min((uint32_t)available_shared_mem / type_size, size));
+        // printf("guck: %u\n", ;
         // uint32_t activeDownsweepThreads = ((res.numElemInBlock / BIN_KEYS_PER_THREAD) + LANE_MASK) & ~LANE_MASK;
         // printf("Active downsweep threads: %u\n", activeDownsweepThreads);
-        res.numElemInBlock  = 512; 
-        res.numThreadBlocks = (size + res.numElemInBlock - 1) / res.numElemInBlock;
-        res.numScanThreads  = (res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
-        res.numDownsweepThreads = 256; // TODO: revisit this
+        res.numElemInBlock  = min(
+            min((uint32_t)available_shared_mem_upsweep / type_size, size) & ~LANE_MASK,
+            1024
+        ); // But, cap at 1024 elements per block
+        
+        res.numThreadBlocks   = (size + res.numElemInBlock - 1) / res.numElemInBlock;
+        res.numUpsweepThreads = ((size + res.numThreadBlocks - 1) / res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
+        res.numScanThreads    = (res.numThreadBlocks + LANE_MASK) & ~LANE_MASK;
         res.downsweepKeysPerThread = min(res.numElemInBlock/ res.numDownsweepThreads, BIN_KEYS_PER_THREAD);
         res.downsweepSharedSize = (res.numElemInBlock + (WARP_SIZE * res.downsweepKeysPerThread) - 1) / ( WARP_SIZE * res.downsweepKeysPerThread ) * RADIX;
 
@@ -411,8 +413,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 errors += 1;
                 break;
             }
-            
-            printf("Validating `passHist`\n");
+
             bool passHistError = false;
             for(uint32_t block=0; block < res.numThreadBlocks; ++block) {
                 uint32_t offset = block * RADIX;
@@ -420,6 +421,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 for(uint32_t digit=0; digit < RADIX; digit++) {
                     uint32_t v_idx = offset + digit;
                     if(cpuPassHist[v_idx] != gpuPassHist[v_idx]) {
+                        if(!passHistError)
+                            printf("Validating `passHist`\n");
                         errors++;
                         passHistError = true;
                         if(errors < 10)
@@ -429,10 +432,11 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             }
             printf("Pass hist validation: %s\n", passHistError ? "FAIL" : "PASS");
 
-            printf("Validating `globalHist`\n");
             bool globalHistError = false;
             for(uint32_t i=0; i<RADIX; ++i) {
                 if(cpuGlobHist[i] != gpuGlobHist[i]) {
+                    if(!globalHistError)
+                        printf("Validating `globalHist`\n");
                     errors++;
                     globalHistError = true;
                     printf("Error @ Digit[%u]: Cpu[%u] Gpu[%u]\n", i, cpuGlobHist[i], gpuGlobHist[i]);
@@ -503,8 +507,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                     sum += passHistBefore[trgt];
                 }
             }
-            
-            printf("Validating `passHist` after scan\n");
+
             bool passHistError = false;
             for (uint32_t digit = 0; digit < RADIX; ++digit) {
                 uint32_t offset = digit * res.numThreadBlocks;
@@ -513,6 +516,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                     // if(digit < 6)
                     //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
                     if(passHistCpu[trgt] != passHistGpu[trgt]) {
+                        if(!passHistError) {
+                            printf("Validating `passHist` after scan\n");
+                        }
                         errors += 1;
                         passHistError = true;
                         if(errors < 8) {
@@ -575,7 +581,6 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 break;
             }
 
-            printf("Validating `sortAlt` after Downsweep: pass[%u]\n", pass);
             bool passError = false;
             for(uint32_t i=1; i<size; ++i) {
                 // Basically at every stage target bits[prev] < bits[current]
@@ -583,6 +588,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 uint32_t curr = toBitsCpu<T, U>(sortPass[i]) >> shift & RADIX_MASK;
 
                 if(prev > curr) {
+                    if(!passError) {
+                        printf("Validating `sortAlt` after Downsweep: pass[%u]\n", pass);
+                    }
                     if(errors < 32) {
                         printf("Error[%u]@pass[%u]: ", i, pass);
                         if constexpr (std::is_same<T, float>::value)

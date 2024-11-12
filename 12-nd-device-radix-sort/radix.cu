@@ -444,7 +444,7 @@ __global__ void RadixDownsweep(
     T* keys,                        // Input array
     T* keysAlt,                     // Output array
     uint32_t* vals,                 // Optional values to be sorted
-    uint32_t* valsAlt,               // Output array
+    uint32_t* valsAlt,              // Output array
     const uint32_t* globalHist,     // Global histogram
     const uint32_t* passHist,       // Pass histogram
     const uint32_t size,            // Total elements to sort
