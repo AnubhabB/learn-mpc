@@ -256,10 +256,13 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     ushort _upExeWidth = _upsweepState->threadExecutionWidth();
     ushort _nUpThreads  = min((uint32_t)(((size + resc.numPartitions - 1) / resc.numPartitions + _upExeWidth) & ~_upExeWidth), (uint32_t)device->maxThreadsPerThreadgroup().width);
     
-    MTL::Size upThreadsPerGroup     = MTL::Size::Make(_nUpThreads, 1, 1);
-    MTL::Size upGroupsPerGrid       = MTL::Size::Make(resc.numPartitions, 1, 1);
+    MTL::Size upThreadsPerGroup   = MTL::Size::Make(_nUpThreads, 1, 1);
+    MTL::Size upGroupsPerGrid     = MTL::Size::Make(resc.numPartitions, 1, 1);
 
-    printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, 0, 0, 0, 0, resc.numElemInPartition);
+    MTL::Size scanThreadsPerGroup = MTL::Size::Make(resc.numScanThreads, 1, 1);
+    MTL::Size scanGroupsPerGrid   = MTL::Size::Make(RADIX, 1, 1);
+
+    printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, resc.numScanThreads, 0, 0, 0, resc.numElemInPartition);
 
     uint32_t* shift = static_cast<uint32_t*>(radixShift->contents());
     // for (uint32_t pass = 0; pass < numPasses; ++pass) {
@@ -267,10 +270,11 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
         *shift = pass * 8;
         printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses - 1, *shift);
 
-        // Create a command buffer and a compute encoder from the buffer
-        MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
         // The upsweep kernel call
         {
+            // Create a command buffer and a compute encoder from the buffer
+            MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+
             // Get current data being sorted
             T* sortData = static_cast<T*>(d_sort->contents());
             printf("Sort data now: \n");
@@ -391,12 +395,84 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
         // Launch RadixScan kernel
         {
-            uint32_t* passHistBefore = static_cast<uint32_t*>(d_passHist->contents());
+            uint32_t pass_hist_size = radixSize * resc.numPartitions;
+
+            // Create a command buffer and a compute encoder from the buffer
+            MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+
+            uint32_t* passHistGpu = static_cast<uint32_t*>(d_passHist->contents());
+            uint32_t* passHistBefore = (uint32_t*)malloc(pass_hist_size);
+            memcpy(passHistBefore, passHistGpu, pass_hist_size);
+
+            // printf("\nBEFORE ==================\n");
+            // for(uint32_t i=0; i<32; ++i) {
+            //     printf("[%u %u] ", i, passHistGpu[i]);
+            // }
+            // printf("\n========================\n");
 
             MTL::ComputeCommandEncoder* scanEncoder = cmdBuffer->computeCommandEncoder();
             scanEncoder->setComputePipelineState(_scanState);
             scanEncoder->setBuffer(d_passHist, 0, 0);
             scanEncoder->setBuffer(numParts, 0, 1);
+
+            scanEncoder->setThreadgroupMemoryLength(resc.numScanThreads * sizeof(uint32_t), 0);
+
+            scanEncoder->dispatchThreadgroups(scanGroupsPerGrid, scanThreadsPerGroup);
+            scanEncoder->endEncoding();
+
+            // // Commit and wait for completion
+            cmdBuffer->commit();
+            cmdBuffer->waitUntilCompleted();
+
+            // printf("\nAFTER ==================\n");
+            // for(uint32_t i=0; i<32; ++i) {
+            //     printf("[%u %u] ", i, passHistGpu[i]);
+            // }
+            // printf("\n========================\n");
+            uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
+            // Create cpu alternate values
+            // Process each partition separately
+            // For each digit
+            for(uint32_t dgt=0; dgt<RADIX; ++dgt) {
+                uint32_t sum = 0;
+                uint32_t offst = dgt * resc.numPartitions;
+
+                for(uint32_t blk=0; blk<resc.numPartitions; ++blk) {
+                    uint32_t trgt = blk + offst;
+                    passHistCpu[trgt] = sum;
+                    sum += passHistBefore[trgt];
+                }
+            }
+
+            bool passHistError = false;
+            for (uint32_t digit = 0; digit < RADIX; ++digit) {
+                uint32_t offset = digit * resc.numPartitions;
+                for(uint32_t block=0; block < resc.numPartitions; ++block) {
+                    uint32_t trgt = offset + block;
+                    // if(digit < 6)
+                    //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
+                    if(passHistCpu[trgt] != passHistGpu[trgt]) {
+                        if(!passHistError) {
+                            printf("Validating `passHist` after scan\n");
+                        }
+                        errors += 1;
+                        passHistError = true;
+                        if(errors < 16) {
+                            printf("Mismatch at digit %u, block %u: GPU = %u, CPU = %u\n", digit, block, passHistGpu[trgt], passHistCpu[trgt]);
+                            printf("Peeking digit %u in passHist: \n", digit);
+                            for(uint32_t blk=0; blk<resc.numPartitions; ++blk) {
+                                uint32_t trg = digit * resc.numPartitions + blk;
+                                printf("[%u %u] ", blk, passHistBefore[trg]);
+                            }
+                            printf("\n");
+                        }
+                    }
+                }
+            }
+            printf("Pass hist validation after `Scan`: %s\n", passHistError ? "FAIL" : "PASS");
+
+            free(passHistBefore);
+            free(passHistCpu);
         }
 
         // Commit and wait for completion
@@ -417,8 +493,8 @@ int main() {
     uint32_t sizes[N] = { 1024, 1120, 2048, 4096, 4113, 7680, 8192, 9216, 16000, 32000, 64000, 128000, 280000 };
     
     // First, test for UpsweepKernel is good?
-    // for(uint32_t i = 0; i < N; i++) {
-    for(uint32_t i = 0; i < 1; i++) {
+    for(uint32_t i = 0; i < N; i++) {
+    // for(uint32_t i = 0; i < 1; i++) {
         {
             printf("`uint32_t`: Validation (sequential)\n");
             uint32_t errors = validate<uint32_t, uint32_t>(sizes[i]);

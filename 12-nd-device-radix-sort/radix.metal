@@ -259,8 +259,74 @@ kernel void name##_##T##_##U(                                 \
 
 kernel void RadixScan(
     device uint32_t* passHist,
-    constant uint32_t &numPartitions
-) {}
+    constant uint32_t &numPartitions,
+    threadgroup uint32_t* s_scan,
+    uint threadIdx [[thread_position_in_threadgroup]],
+    uint laneIdx   [[thread_index_in_simdgroup]],
+    uint groupIdx  [[threadgroup_position_in_grid]],
+    uint groupDim  [[threads_per_threadgroup]]
+) {
+    // Circular shift within warp - this helps reduce bank conflicts
+    // Get ID of the next thread: laneIdx: 0 -> 1, 1 -> 2 ... 31 -> 0
+    const uint32_t circularLaneShift = (laneIdx + 1) & LANE_MASK;
+
+    // Where does the digit start
+    const uint32_t digitOffset = groupIdx * numPartitions;
+
+    // Calculate the number of full block-sized chunks we need to process
+    const uint32_t fullBlocksEnd = (numPartitions / groupDim) * groupDim;
+
+    // Running sum for carrying over between iterations
+    uint32_t reduction = 0;
+
+    uint32_t tidx = threadIdx;
+    for (; tidx < fullBlocksEnd; tidx += groupDim) {
+        s_scan[threadIdx] = passHist[threadIdx + digitOffset];
+
+        // Perform warp-level scan
+        s_scan[threadIdx] = simd_prefix_inclusive_sum(s_scan[threadIdx]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Collect and scan warp totals
+        if (threadIdx < (groupDim >> LANE_LOG)) {
+            s_scan[((threadIdx + 1) << LANE_LOG) - 1] = simd_prefix_inclusive_sum(s_scan[((threadIdx + 1) << LANE_LOG) - 1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint32_t writeIdx = circularLaneShift + (tidx & ~LANE_MASK);
+
+        passHist[writeIdx + digitOffset] =
+            (laneIdx != LANE_MASK ? s_scan[threadIdx] : 0) +
+            (threadIdx >= SIMD_SIZE ?
+            s_scan[(threadIdx & ~LANE_MASK) - 1] : 0) +
+            reduction;
+
+        reduction += s_scan[groupDim - 1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Remaining elements handled similarly...
+    if (tidx < numPartitions) {
+        s_scan[threadIdx] = passHist[threadIdx + digitOffset];
+    }
+
+    s_scan[threadIdx] = simd_prefix_inclusive_sum(s_scan[threadIdx]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (threadIdx < (groupDim >> LANE_LOG)) {
+        s_scan[((threadIdx + 1) << LANE_LOG) - 1] = simd_prefix_inclusive_sum(s_scan[((threadIdx + 1) << LANE_LOG) - 1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint32_t writeIdx = circularLaneShift + (tidx & ~LANE_MASK);
+    if (writeIdx < numPartitions) {
+        passHist[writeIdx + digitOffset] =
+            (laneIdx != LANE_MASK ? s_scan[threadIdx] : 0) +
+            (threadIdx >= SIMD_SIZE ?
+            s_scan[(threadIdx & ~LANE_MASK) - 1] : 0) +
+            reduction;
+    }
+}
 
 kernel void RadixDownsweep() {
 
