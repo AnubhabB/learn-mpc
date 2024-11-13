@@ -3,7 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-#define N_THREADS           256
+// #define N_THREADS           256
 #define RADIX               256             //Number of digit bins
 #define WARP_SIZE           32
 #define LANE_LOG            5               // LANE_LOG = 5 since 2^5 = 32 = warp size
@@ -109,7 +109,6 @@ __device__ inline U toBits(T val) {
     // } else if constexpr (std::is_same<T, int64_t>::value) {
     //     return static_cast<U>(val) ^ 0x8000000000000000;
     } else {
-        // Should be unreachable!
         return static_cast<U>(val);
     }
 }
