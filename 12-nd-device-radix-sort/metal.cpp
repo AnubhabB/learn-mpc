@@ -284,8 +284,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, resc.numScanThreads, resc.numDownsweepThreads, resc.downsweepSharedSize, resc.downsweepKeysPerThread, resc.numElemInPartition);
 
     uint32_t* shift = static_cast<uint32_t*>(radixShift->contents());
-    // for (uint32_t pass = 0; pass < numPasses; ++pass) {
-    for (uint32_t pass = 0; pass < 1; ++pass) {
+    for (uint32_t pass = 0; pass < numPasses; ++pass) {
+    // for (uint32_t pass = 0; pass < 1; ++pass) {
         *shift = pass * 8;
         printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses - 1, *shift);
 
@@ -514,6 +514,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             downEncoder->setBuffer(d_sortIdx, 0, 11);
 
             downEncoder->setThreadgroupMemoryLength(resc.downsweepSharedSize * sizeof(uint32_t), 0);
+            downEncoder->setThreadgroupMemoryLength(RADIX * sizeof(uint32_t), 1);
 
             downEncoder->dispatchThreadgroups(upDownGroupsPerGrid, downThreadsPerGroup);
             downEncoder->endEncoding();
@@ -530,6 +531,10 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             printf("Breaking at pass %u\n", pass);
             break;
         }
+
+        // TODO
+        // std::swap(d_sort, d_sortAlt);
+        // std::swap(d_idx, d_idxAlt);
     }
 
     return errors;

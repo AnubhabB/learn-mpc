@@ -565,7 +565,6 @@ __global__ void RadixDownsweep(
 
     //scatter runs of keys into device memory
     uint8_t digits[BIN_KEYS_PER_THREAD];
-    // if (blockIdx.x < gridDim.x - 1) {
     uint32_t partSize = size - blockOffset;
     #pragma unroll
     for(uint32_t i=0, t=threadIdx.x; i<BIN_KEYS_PER_THREAD; ++i, t += blockDim.x) {

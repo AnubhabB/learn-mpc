@@ -10,6 +10,7 @@ R"(#include <metal_stdlib>
 #define RADIX_MASK (RADIX - 1)
 
 #define VECTORIZE_SIZE 4
+#define BIN_KEYS_PER_THREAD 15
 
 using namespace metal;
 
@@ -146,6 +147,50 @@ struct VectorLoad<uint8_t, uint8_t> {
     }
 };
 
+/***********************
+*
+Helper function to get type-specific maximum value
+*
+***********************/
+template<typename T>
+inline T getTypeMax() {
+    // this should be unreachable
+    return static_cast<T>(1);
+}
+
+template<>
+inline uint8_t getTypeMax() {
+    return 0xFF; // 255
+}
+
+/*
+template<>
+inline half getTypeMax() {
+    return 0xFF; // 255
+}
+
+template<>
+inlint bfloat getTypeMax() {
+    return 0xFF; // 255
+}
+*/
+
+template<>
+inline float getTypeMax() {
+    return INFINITY;
+}
+
+template<>
+inline uint32_t getTypeMax() {
+    return 0xFFFFFFFF;  // 4294967295
+}
+
+/***********************
+*
+Radix sort kernels
+*
+***********************/
+
 // Radix Upsweep pass does the following:
 // radixShift - signifies which `digit` position is being worked on in strides of 8 - first pass for MSB -> last 8 bits using radix 256
 // passHist - for a particular digit position creates a frequency of values -
@@ -235,8 +280,6 @@ METAL_FUNC void RadixUpsweep(
             memory_order_relaxed
         );
     }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 kernel void RadixScan(
@@ -312,23 +355,190 @@ kernel void RadixScan(
 
 template<typename T, typename U>
 METAL_FUNC void RadixDownsweep(
-    device const T* keys,
-    device T* keysAlt,
-    device const uint32_t* vals,
-    device uint32_t* valsAlt,
-    device const uint32_t* globalHist,
-    device const uint32_t* passHist,
-    constant uint32_t &size,
-    constant uint32_t &radixShift,
-    constant uint32_t &partSize,
-    constant uint32_t &histSize,
-    constant uint32_t &numKeysPerThread,
-    constant bool     &sortIdx,
-    threadgroup atomic_uint* s_globalHist [[threadgroup(0)]],
-    uint threadIdx[[thread_position_in_threadgroup]],
-    uint gridDim  [[threadgroups_per_grid]]
+    device const T* keys,               // Input array
+    device T* keysAlt,                  // Output array
+    device const uint32_t* vals,        // [Optional] payload/ values to be sorted - for our usecase these are indices
+    device uint32_t* valsAlt,           // [Optional] output for values/ payload
+    device const uint32_t* globalHist,  // Global histogram
+    device const uint32_t* passHist,    // Pass histogram
+    constant uint32_t &size,            // length of input array
+    constant uint32_t &radixShift,      // current radixShift bit
+    constant uint32_t &partSize,        // Number of elements processed per partition/ block
+    constant uint32_t &histSize,        // size of the histogram initialized externally
+    constant uint32_t &numKeysPerThread,// real number of keys processed by each thread. Max would be `BIN_KEYS_PER_THREAD`
+    constant bool     &sortIdx,         // if set to true, attempt to sort the indices
+    threadgroup uint32_t* s_tmp [[threadgroup(0)]],            // Shared memory layout, used for `s_simdHistograms` and later for `s_keys` and [optional]`s_values`
+    threadgroup uint32_t* s_localHistogram [[threadgroup(1)]], // local histogram/ secondary storage
+    uint threadIdx [[thread_position_in_threadgroup]],
+    uint laneIdx   [[thread_index_in_simdgroup]],
+    uint simdIdx   [[simdgroup_index_in_threadgroup]],
+    uint groupIdx  [[threadgroup_position_in_grid]],
+    uint groupDim  [[threads_per_threadgroup]],
+    uint gridDim   [[threadgroups_per_grid]]
 ) {
-    uint32_t h = 1;
+    volatile threadgroup atomic_uint* s_simdHist = reinterpret_cast<threadgroup atomic_uint*>(&s_tmp[simdIdx << RADIX_LOG]);
+
+    // for warp histogram temp storage
+    threadgroup uint32_t* s_simdHistograms = s_tmp;
+
+    // The partition offset of keys to work with
+    const uint32_t blockOffset = groupIdx * partSize;
+    const uint32_t tidInSimd   = ((numKeysPerThread << LANE_LOG) * simdIdx) + laneIdx;
+
+    //clear shared memory
+    for (uint32_t i = threadIdx; i < histSize; i += groupDim)
+        s_tmp[i] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    thread uint32_t threadStore[BIN_KEYS_PER_THREAD]; // local store for max keys per thread to be later used for indices
+    thread uint16_t offsets[BIN_KEYS_PER_THREAD];
+
+    thread T* threadKeys = reinterpret_cast<thread T*>(threadStore);
+
+    //load keys
+    // We are going to be processing `BIN_KEYS_PER_THREAD` keys per thread
+    // The starting location of the each key =
+    //        Block in which a key belongs (block index * maxElemenInBlock) +
+    //        (In a block, offset of a key with respect to warps
+    //              Number of elements per warp (BIN_KEYS_PER_THREAD * WARP_SIZE) * Warp Index) +
+    //         LaneId
+    //
+    // To handle input sizes not perfect multiples of the partition tile size,
+    // load "dummy" keys, which are keys with the highest possible digit.
+    // Because of the stability of the sort, these keys are guaranteed to be 
+    // last when scattered. This allows for effortless divergence free sorting
+    // of the final partition.
+    #pragma unroll
+    for (uint32_t i=0, t=blockOffset + tidInSimd; i<numKeysPerThread;++i, t+=SIMD_SIZE) {
+        threadKeys[i] = t < size ? keys[t] : getTypeMax<T>();
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // WLMS (warp-level multi-split) Ashkiani et al (https://arxiv.org/pdf/1701.01189)
+    // Computes warp level histogram for digits
+    #pragma unroll
+    for (uint32_t i = 0; i < numKeysPerThread; ++i) {
+        U bitval = toBits<T, U>(threadKeys[i]);
+
+        // creating mask for threads in a warp that have same bit value as keys[i]
+        unsigned simdFlags = 0xffffffff;
+        #pragma unroll
+        for (int k = 0; k < RADIX_LOG; ++k) {
+            // true if `radixShift + kth` position is 1
+            const bool t2 = (bitval >> (k + radixShift)) & 1;
+            simdFlags &= (t2 ? 0 : 0xffffffff) ^ (simd_vote::vote_t)simd_ballot(t2);
+        }
+
+        const uint32_t bits = popcount(simdFlags & ((1u << laneIdx) - 1));
+        uint32_t preIncrementVal;
+        // Update histogram count only once per warp
+        if (bits == 0) {
+            preIncrementVal = atomic_fetch_add_explicit(&s_simdHist[(bitval >> radixShift) & RADIX_MASK], popcount(simdFlags), memory_order_relaxed);
+        }
+
+        offsets[i] = simd_shuffle(preIncrementVal, ctz(simdFlags)) + bits;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // At this stage we have `simd-level` histograms
+    // exclusive prefix sum up the simd histograms
+    if (threadIdx < RADIX) {
+        uint32_t reduction = s_simdHistograms[threadIdx];
+        for (uint32_t i = threadIdx + RADIX; i < histSize; i += RADIX) {
+            reduction += s_simdHistograms[i];
+            s_simdHistograms[i] = reduction - s_simdHistograms[i];
+        }
+
+        //begin the exclusive prefix sum across the reductions
+        s_simdHistograms[threadIdx] = inclusive_scan_circular(reduction, laneIdx);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Update the first threads of warps
+    if (threadIdx < (RADIX >> LANE_LOG)) {
+        uint32_t val = s_simdHistograms[threadIdx << LANE_LOG];
+        s_simdHistograms[threadIdx << LANE_LOG] = active_exclusive_simd_scan(val, laneIdx);
+
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (threadIdx < RADIX && laneIdx)
+        s_simdHistograms[threadIdx] += simd_shuffle(s_simdHistograms[threadIdx - 1], 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //update offsets
+    if (simdIdx) {
+        #pragma unroll
+        for (uint32_t i = 0; i < numKeysPerThread; ++i) {
+            const U t2 = toBits<T, U>(threadKeys[i]) >> radixShift & RADIX_MASK;
+            offsets[i] += static_cast<uint32_t>(atomic_load_explicit(&s_simdHist[t2], memory_order_relaxed)) + s_simdHistograms[t2];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t i = 0; i < numKeysPerThread; ++i)
+            offsets[i] += s_simdHistograms[toBits<T, U>(threadKeys[i]) >> radixShift & RADIX_MASK];
+    }
+
+    //load in threadblock reductions
+    #pragma unroll
+    for (uint32_t i=threadIdx; i<RADIX; i+=groupDim) {
+        s_localHistogram[i] = globalHist[i + (radixShift << LANE_LOG)] +
+            passHist[i * gridDim + groupIdx] - s_simdHistograms[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // `s_tmp` has done with it's job as warp histogram bookkeeper
+    // let's re-use it for our keys
+    threadgroup T* s_keys = reinterpret_cast<threadgroup T*>(s_tmp);
+    
+    // scatter keys into shared memory
+    #pragma unroll
+    for (uint32_t i = 0; i < numKeysPerThread; ++i) {
+        s_keys[offsets[i]] = threadKeys[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    //scatter runs of keys into device memory
+    uint8_t digits[BIN_KEYS_PER_THREAD];
+    uint32_t pSize = size - blockOffset;
+    #pragma unroll
+    for(uint32_t i=0, t=threadIdx; i<BIN_KEYS_PER_THREAD; ++i, t += groupDim) {
+        if (i < numKeysPerThread && t < pSize) {
+            digits[i] = toBits<T, U>(s_keys[t]) >> radixShift & RADIX_MASK;
+            keysAlt[s_localHistogram[digits[i]] + t] = s_keys[t];
+        }
+    }
+
+    if (!sortIdx)
+        return;
+    threadgroup_barrier(mem_flags::mem_device); // this is required only if we proceed with sorting of indices
+
+    // `s_tmp` has done with it's job as warp histogram bookkeeper & keys
+    // let's re-use it for our vals
+    threadgroup uint32_t* s_vals = reinterpret_cast<threadgroup uint32_t*>(s_tmp);
+    thread uint32_t* threadVals = reinterpret_cast<thread uint32_t*>(threadStore);
+
+    // Load indices into registers
+    #pragma unroll
+    for (uint32_t i = 0, t = blockOffset + tidInSimd; i < numKeysPerThread; ++i, t += SIMD_SIZE) {
+        threadVals[i] = t < size ? vals[t] : size; // `size` is a placeholder here > max index
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // scatter keys into shared memory
+    #pragma unroll
+    for (uint32_t i = 0; i < numKeysPerThread; ++i) {
+        s_vals[offsets[i]] = threadVals[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    #pragma unroll
+    for(uint32_t i=0, t=threadIdx; i<BIN_KEYS_PER_THREAD; ++i, t += groupDim) {
+        if (i < numKeysPerThread && t < pSize) {
+            valsAlt[s_localHistogram[digits[i]] + t] = s_vals[t];
+        }
+    }
 }
 
 #define UPSWEEP(T, U, name)                                   \
@@ -363,8 +573,13 @@ kernel void name##_##T##_##U(                                 \
     constant uint32_t &histSize,                              \
     constant uint32_t &numKeysPerThread,                      \
     constant bool     &sortIdx,                               \
-    threadgroup atomic_uint* s_globalHist [[threadgroup(0)]], \
-    uint threadIdx[[thread_position_in_threadgroup]],         \
+    threadgroup uint32_t* s_tmp [[threadgroup(0)]],           \
+    threadgroup uint32_t* s_localHistogram [[threadgroup(1)]],\
+    uint threadIdx [[thread_position_in_threadgroup]],        \
+    uint laneIdx   [[thread_index_in_simdgroup]],             \
+    uint simdIdx   [[simdgroup_index_in_threadgroup]],        \
+    uint groupIdx  [[threadgroup_position_in_grid]],          \
+    uint groupDim  [[threads_per_threadgroup]],               \
     uint gridDim  [[threadgroups_per_grid]]                   \
 ) {                                                           \
     RadixDownsweep<T, U>(                                     \
@@ -380,12 +595,22 @@ kernel void name##_##T##_##U(                                 \
         histSize,                                             \
         numKeysPerThread,                                     \
         sortIdx,                                              \
-        s_globalHist,                                         \
+        s_tmp,                                                \
+        s_localHistogram,                                     \
         threadIdx,                                            \
+        laneIdx,                                              \
+        simdIdx,                                              \
+        groupIdx,                                             \
+        groupDim,                                             \
         gridDim                                               \
     );                                                        \
 }                                                             \
 
+/***********************
+*
+Macros
+*
+***********************/
 
 UPSWEEP(uint8_t, uint8_t, RadixUpsweep)
 UPSWEEP(float, uint32_t, RadixUpsweep)
