@@ -14,6 +14,8 @@ using namespace std;
 #define SIMD_SIZE 32 // This can change, can we visit this later?
 #define LANE_MASK (SIMD_SIZE - 1)
 
+#define BIN_KEYS_PER_THREAD 15
+
 // Load the `.metal` kernel definition as a string
 static const char* kernel = {
     #include "radix.metal"
@@ -130,9 +132,12 @@ bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, bool seq, bool withId
 
 // Calculate resources to run
 struct Resources {
-    uint32_t numPartitions;       // number of threadblocks to run for Upsweep and DownsweepPairs kernel
-    uint32_t numElemInPartition;  // number of elements per partition
-    uint32_t numScanThreads;      // number of threads to launch the scan kernel
+    uint32_t numPartitions;          // number of threadblocks to run for Upsweep and DownsweepPairs kernel
+    uint32_t numElemInPartition;     // number of elements per partition
+    uint32_t numScanThreads;         // number of threads to launch the scan kernel
+    uint32_t numDownsweepThreads;    // number of downsweep threads
+    uint32_t downsweepKeysPerThread; // number of keys to be processed by one downsweep thread capped at BIN_KEYS_PER_THREAD
+    uint32_t downsweepSharedSize;    // shared memory size of downsweep threads
 
     static Resources compute(MTL::Device* device, uint32_t size, uint32_t type_size) {
         Resources resc;
@@ -146,6 +151,10 @@ struct Resources {
 
         resc.numPartitions   = (size + resc.numElemInPartition - 1) / resc.numElemInPartition;
         resc.numScanThreads  = (resc.numPartitions + LANE_MASK) & ~LANE_MASK;
+
+        resc.numDownsweepThreads    = 512;
+        resc.downsweepKeysPerThread = min(resc.numElemInPartition/ resc.numDownsweepThreads, (uint32_t)BIN_KEYS_PER_THREAD);
+        resc.downsweepSharedSize    = (resc.numElemInPartition + (SIMD_SIZE * resc.downsweepKeysPerThread) - 1) / ( SIMD_SIZE * resc.downsweepKeysPerThread ) * RADIX;
 
         return resc;
     }
@@ -182,18 +191,23 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
     // kernel names
     char upsweepFn[32];
+    char downsweepFn[36];
     if constexpr (std::is_same<T, uint8_t>::value) {
         // upFn = upFn + "uint8_t_uint8_t";
         strcpy(upsweepFn, "RadixUpsweep_uint8_t_uint8_t");
+        strcpy(downsweepFn, "RadixDownsweep_uint8_t_uint8_t");
     } else if constexpr (std::is_same<T, uint32_t>::value) {
         strcpy(upsweepFn, "RadixUpsweep_uint32_t_uint32_t");
+        strcpy(downsweepFn, "RadixDownsweep_uint32_t_uint32_t");
     } else if constexpr (std::is_same<T, float>::value) {
         strcpy(upsweepFn, "RadixUpsweep_float_uint32_t");
+        strcpy(downsweepFn, "RadixDownsweep_float_uint32_t");
+
     }
 
     MTL::Function* _up   = library->newFunction( NS::String::string(upsweepFn, NS::UTF8StringEncoding) );
     MTL::Function* _scan = library->newFunction( NS::String::string("RadixScan", NS::UTF8StringEncoding) );
-    MTL::Function* _down = library->newFunction( NS::String::string("RadixDownsweep", NS::UTF8StringEncoding) );
+    MTL::Function* _down = library->newFunction( NS::String::string(downsweepFn, NS::UTF8StringEncoding) );
 
     if(!_up) {
         errors += 1;
@@ -212,10 +226,13 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     MTL::Buffer* d_idxAlt     = device->newBuffer(idxSize, MTL::ResourceStorageModeShared);
 
     // Other stuff
-    MTL::Buffer* d_size       = device->newBuffer(&size, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
-    MTL::Buffer* radixShift   = device->newBuffer(sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    MTL::Buffer* elemsPerPart = device->newBuffer(&resc.numElemInPartition, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
-    MTL::Buffer* numParts     = device->newBuffer(&resc.numPartitions, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    MTL::Buffer* d_size          = device->newBuffer(&size, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    MTL::Buffer* radixShift      = device->newBuffer(sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    MTL::Buffer* elemsPerPart    = device->newBuffer(&resc.numElemInPartition, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    MTL::Buffer* numParts        = device->newBuffer(&resc.numPartitions, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    MTL::Buffer* d_histsSize     = device->newBuffer(&resc.downsweepSharedSize, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    MTL::Buffer* d_keysPerThread = device->newBuffer(&resc.downsweepKeysPerThread, sizeof(uint32_t), MTL::ResourceStorageModePrivate);
+    MTL::Buffer* d_sortIdx       = device->newBuffer(&withId, sizeof(bool), MTL::ResourceStorageModePrivate);
 
     // Create some data
     T* sort_buf       = static_cast<T*>(d_sort->contents());
@@ -257,12 +274,14 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     ushort _nUpThreads  = min((uint32_t)(((size + resc.numPartitions - 1) / resc.numPartitions + _upExeWidth) & ~_upExeWidth), (uint32_t)device->maxThreadsPerThreadgroup().width);
     
     MTL::Size upThreadsPerGroup   = MTL::Size::Make(_nUpThreads, 1, 1);
-    MTL::Size upGroupsPerGrid     = MTL::Size::Make(resc.numPartitions, 1, 1);
+    MTL::Size upDownGroupsPerGrid = MTL::Size::Make(resc.numPartitions, 1, 1);
 
     MTL::Size scanThreadsPerGroup = MTL::Size::Make(resc.numScanThreads, 1, 1);
     MTL::Size scanGroupsPerGrid   = MTL::Size::Make(RADIX, 1, 1);
 
-    printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, resc.numScanThreads, 0, 0, 0, resc.numElemInPartition);
+    MTL::Size downThreadsPerGroup = MTL::Size::Make(resc.numDownsweepThreads, 1, 1);
+
+    printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, resc.numScanThreads, resc.numDownsweepThreads, resc.downsweepSharedSize, resc.downsweepKeysPerThread, resc.numElemInPartition);
 
     uint32_t* shift = static_cast<uint32_t*>(radixShift->contents());
     // for (uint32_t pass = 0; pass < numPasses; ++pass) {
@@ -311,7 +330,7 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
             upsweepEncoder->setThreadgroupMemoryLength(RADIX * sizeof(uint32_t), 0);
 
-            upsweepEncoder->dispatchThreadgroups(upGroupsPerGrid, upThreadsPerGroup);
+            upsweepEncoder->dispatchThreadgroups(upDownGroupsPerGrid, upThreadsPerGroup);
             upsweepEncoder->endEncoding();
 
             // // Commit and wait for completion
@@ -473,6 +492,34 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
             free(passHistBefore);
             free(passHistCpu);
+        }
+
+        // Finally the downsweep kernel
+        {
+            // Create a command buffer and a compute encoder from the buffer
+            MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+            MTL::ComputeCommandEncoder* downEncoder = cmdBuffer->computeCommandEncoder();
+            downEncoder->setComputePipelineState(_downsweepState);
+            downEncoder->setBuffer(d_sort, 0, 0);
+            downEncoder->setBuffer(d_sortAlt, 0, 1);
+            downEncoder->setBuffer(d_idx, 0, 2);
+            downEncoder->setBuffer(d_idxAlt, 0, 3);
+            downEncoder->setBuffer(d_globalHist, 0, 4);
+            downEncoder->setBuffer(d_passHist, 0, 5);
+            downEncoder->setBuffer(d_size, 0, 6);
+            downEncoder->setBuffer(radixShift, 0, 7);
+            downEncoder->setBuffer(elemsPerPart, 0, 8);
+            downEncoder->setBuffer(d_histsSize, 0, 9);
+            downEncoder->setBuffer(d_keysPerThread, 0, 10);
+            downEncoder->setBuffer(d_sortIdx, 0, 11);
+
+            downEncoder->setThreadgroupMemoryLength(resc.downsweepSharedSize * sizeof(uint32_t), 0);
+
+            downEncoder->dispatchThreadgroups(upDownGroupsPerGrid, downThreadsPerGroup);
+            downEncoder->endEncoding();
+
+            cmdBuffer->commit();
+            cmdBuffer->waitUntilCompleted();
         }
 
         // Commit and wait for completion

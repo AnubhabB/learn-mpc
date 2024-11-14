@@ -239,24 +239,6 @@ METAL_FUNC void RadixUpsweep(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-#define UPSWEEP(T, U, name)                                   \
-kernel void name##_##T##_##U(                                 \
-    device const T* keys,                                     \
-    device atomic_uint* globalHist,                           \
-    device uint32_t* passHist,                                \
-    constant uint32_t &size,                                  \
-    constant uint32_t &radixShift,                            \
-    constant uint32_t &partSize,                              \
-    threadgroup atomic_uint* s_globalHist [[threadgroup(0)]], \
-    uint threadIdx[[thread_position_in_threadgroup]],         \
-    uint threadIdxInSimdGroup [[thread_index_in_simdgroup]],  \
-    uint groupIdx[[threadgroup_position_in_grid]],            \
-    uint groupDim[[threads_per_threadgroup]],                 \
-    uint gridDim  [[threadgroups_per_grid]]                   \
-) {                                                           \
-    RadixUpsweep<T, U>(keys, globalHist, passHist, size, radixShift, partSize, s_globalHist, threadIdx, threadIdxInSimdGroup, groupIdx, groupDim, gridDim); \
-}                                                             \
-
 kernel void RadixScan(
     device uint32_t* passHist,
     constant uint32_t &numPartitions,
@@ -328,11 +310,88 @@ kernel void RadixScan(
     }
 }
 
-kernel void RadixDownsweep() {
-
+template<typename T, typename U>
+METAL_FUNC void RadixDownsweep(
+    device const T* keys,
+    device T* keysAlt,
+    device const uint32_t* vals,
+    device uint32_t* valsAlt,
+    device const uint32_t* globalHist,
+    device const uint32_t* passHist,
+    constant uint32_t &size,
+    constant uint32_t &radixShift,
+    constant uint32_t &partSize,
+    constant uint32_t &histSize,
+    constant uint32_t &numKeysPerThread,
+    constant bool     &sortIdx,
+    threadgroup atomic_uint* s_globalHist [[threadgroup(0)]],
+    uint threadIdx[[thread_position_in_threadgroup]],
+    uint gridDim  [[threadgroups_per_grid]]
+) {
+    uint32_t h = 1;
 }
+
+#define UPSWEEP(T, U, name)                                   \
+kernel void name##_##T##_##U(                                 \
+    device const T* keys,                                     \
+    device atomic_uint* globalHist,                           \
+    device uint32_t* passHist,                                \
+    constant uint32_t &size,                                  \
+    constant uint32_t &radixShift,                            \
+    constant uint32_t &partSize,                              \
+    threadgroup atomic_uint* s_globalHist [[threadgroup(0)]], \
+    uint threadIdx[[thread_position_in_threadgroup]],         \
+    uint threadIdxInSimdGroup [[thread_index_in_simdgroup]],  \
+    uint groupIdx[[threadgroup_position_in_grid]],            \
+    uint groupDim[[threads_per_threadgroup]],                 \
+    uint gridDim  [[threadgroups_per_grid]]                   \
+) {                                                           \
+    RadixUpsweep<T, U>(keys, globalHist, passHist, size, radixShift, partSize, s_globalHist, threadIdx, threadIdxInSimdGroup, groupIdx, groupDim, gridDim); \
+}                                                             \
+
+#define DOWNSWEEP(T, U, name)                                 \
+kernel void name##_##T##_##U(                                 \
+    device const T* keys,                                     \
+    device T* keysAlt,                                        \
+    device const uint32_t* vals,                              \
+    device uint32_t* valsAlt,                                 \
+    device const uint32_t* globalHist,                        \
+    device const uint32_t* passHist,                          \
+    constant uint32_t &size,                                  \
+    constant uint32_t &radixShift,                            \
+    constant uint32_t &partSize,                              \
+    constant uint32_t &histSize,                              \
+    constant uint32_t &numKeysPerThread,                      \
+    constant bool     &sortIdx,                               \
+    threadgroup atomic_uint* s_globalHist [[threadgroup(0)]], \
+    uint threadIdx[[thread_position_in_threadgroup]],         \
+    uint gridDim  [[threadgroups_per_grid]]                   \
+) {                                                           \
+    RadixDownsweep<T, U>(                                     \
+        keys,                                                 \
+        keysAlt,                                              \
+        vals,                                                 \
+        valsAlt,                                              \
+        globalHist,                                           \
+        passHist,                                             \
+        size,                                                 \
+        radixShift,                                           \
+        partSize,                                             \
+        histSize,                                             \
+        numKeysPerThread,                                     \
+        sortIdx,                                              \
+        s_globalHist,                                         \
+        threadIdx,                                            \
+        gridDim                                               \
+    );                                                        \
+}                                                             \
+
 
 UPSWEEP(uint8_t, uint8_t, RadixUpsweep)
 UPSWEEP(float, uint32_t, RadixUpsweep)
 UPSWEEP(uint32_t, uint32_t, RadixUpsweep)
+
+DOWNSWEEP(uint8_t, uint8_t, RadixDownsweep)
+DOWNSWEEP(float, uint32_t, RadixDownsweep)
+DOWNSWEEP(uint32_t, uint32_t, RadixDownsweep)
 )"
