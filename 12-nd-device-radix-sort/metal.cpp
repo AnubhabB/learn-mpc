@@ -240,6 +240,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
         return errors;
     }
 
+    T* unsorted = (T*)malloc(sortSize);
+    memcpy(unsorted, sort_buf, sortSize);
+
     // Set global histogram to zero
     void* gHist = d_globalHist->contents();
     std::memset(gHist, 0, d_globalHist->length());
@@ -573,6 +576,72 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
         if (withId)
             std::swap(d_idx, d_idxAlt);
     }
+
+    // All passes are done!
+    // let's do a final validation of the sort data
+    // T* sorted = (T*)malloc(sortSize);
+    // c_ret = cudaMemcpy(sorted, d_sort, sortSize, cudaMemcpyDeviceToHost);
+    // if(c_ret) {
+    //     errors += 1;
+    //     printf("[Final Validation Data copy] Cuda Error: %s", cudaGetErrorString(c_ret));
+    //     return errors;
+    // }
+
+    // uint32_t* sortedIdx;
+    // if (withId) {
+    //     sortedIdx = (uint32_t*)malloc(idxSize);
+    //     c_ret = cudaMemcpy(sortedIdx, d_idx, idxSize, cudaMemcpyDeviceToHost);
+    //     if (c_ret) {
+    //         errors += 1;
+    //         printf("[Final Validation Idx copy] Cuda Error: %s", cudaGetErrorString(c_ret));
+    //         return errors;
+    //     }
+    // }
+
+    // cudaDeviceSynchronize();
+
+    T* sorted = static_cast<T*>(d_sort->contents());
+    uint32_t* sortedIdx = static_cast<uint32_t*>(d_idx->contents());
+
+    printf("Validating final sort data with Indices: %s\n", withId ? "TRUE" : "FALSE");
+    bool isSorted = true;
+    for(uint32_t idx=1; idx<size; ++idx) {
+        if(
+            (!dataseq && sorted[idx - 1] > sorted[idx]) ||
+            (dataseq && sorted[idx - 1] >= sorted[idx]) ||
+            withId ? ( sorted[idx] != unsorted[sortedIdx[idx]] ) : false
+        ) {
+            isSorted = false;
+            errors += 1;
+            if(errors < 16) {
+                printf("Unsorted[%u]: ", idx);
+                if constexpr (std::is_same<T, float>::value) {
+                    printf("Prev[%f] This[%f]", sorted[idx - 1], sorted[idx]);
+                    if (withId)
+                        printf(" Original[%u][%f]", sortedIdx[idx], unsorted[sortedIdx[idx]]);
+                // else if constexpr (std::is_same<T, half>::value)
+                //     printf("Prev[%f] This[%f]", __half2float(sorted[idx - 1]), __half2float(sorted[idx]));
+                // else if constexpr (std::is_same<T, nv_bfloat16>::value)
+                //     printf("Prev[%f] This[%f]", __bfloat162float(sorted[idx - 1]), __bfloat162float(sorted[idx]));
+                } else if constexpr (std::is_same<T, uint32_t>::value) {
+                    printf("Prev[%u] This[%u]", sorted[idx - 1], sorted[idx]);
+                    if (withId)
+                        printf(" Original[%u][%u]", sortedIdx[idx], unsorted[sortedIdx[idx]]);
+                } // else if constexpr (std::is_same<T, int64_t>::value)
+                //     printf("Prev[%ld] This[%ld]", (long)sorted[idx - 1], (long)sorted[idx]);
+                printf("\n");
+            }
+        }
+
+        // a test of stability of this sort!
+        if (withId) {
+            if (sorted[idx - 1] == sorted[idx] && sortedIdx[idx - 1] >= sortedIdx[idx]) {
+                printf("Stability Issue[%u]: Prev[%u] Now[%u]\n", idx, sortedIdx[idx - 1], sortedIdx[idx]);
+            }
+        }
+    }
+    printf("Final sort validation: `%s`\n", isSorted ? "PASS" : "FAIL");
+    printf("=========================================================\n");
 
     return errors;
 }

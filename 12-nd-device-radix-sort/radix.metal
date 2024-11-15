@@ -59,6 +59,31 @@ inline uchar toBits<uint8_t, uint8_t>(uint8_t val) {
     return static_cast<uint8_t>(val);
 }
 
+// Explicit specialization for half
+template<>
+inline ushort toBits<half, ushort>(half val) {
+    if (isfinite(val)) {
+        uint32_t bits = as_type<ushort>(val);  // Metal's bit casting
+        return static_cast<ushort>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
+    }
+
+    return isnan(val) || val > 0.0 ? 0xFFFF : 0;
+}
+
+/*
+#if defined(__HAVE_BFLOAT__)
+template<>
+inline ushort toBits<bfloat, ushort>(bfloat val) {
+    if (isfinite(val)) {
+        uint32_t bits = as_type<ushort>(val);  // Metal's bit casting
+        return static_cast<ushort>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
+    }
+
+    return isnan(val) || val > 0.0 ? 0xFFFF : 0;
+}
+#endif
+*/
+
 // Explicit specialization for float
 template<>
 inline uint32_t toBits<float, uint32_t>(float val) {
@@ -163,6 +188,20 @@ template<>
 inline uint8_t getTypeMax() {
     return 0xFF; // 255
 }
+
+template<>
+inline half getTypeMax() {
+    return HUGE_VALH; // +infinity
+}
+
+/*
+#if defined(__HAVE_BFLOAT__)
+template<>
+inline bfloat getTypeMax() {
+    return HUGE_VALBF; // +infinity
+}
+#endif
+*/
 
 template<>
 inline float getTypeMax() {
@@ -503,7 +542,6 @@ METAL_FUNC void RadixDownsweep(
         return;
     threadgroup_barrier(mem_flags::mem_device); // this is required only if we proceed with sorting of indices
 
-    /*
     // `s_tmp` has done with it's job as warp histogram bookkeeper & keys
     // let's re-use it for our vals
     threadgroup uint32_t* s_vals = reinterpret_cast<threadgroup uint32_t*>(s_tmp);
@@ -529,7 +567,6 @@ METAL_FUNC void RadixDownsweep(
             valsAlt[s_localHistogram[digits[i]] + t] = s_vals[t];
         }
     }
-    */
 }
 
 #define UPSWEEP(T, U, name)                                   \
@@ -604,10 +641,17 @@ Macros
 ***********************/
 
 UPSWEEP(uint8_t, uint8_t, RadixUpsweep)
+UPSWEEP(half, ushort, RadixUpsweep)
 UPSWEEP(float, uint32_t, RadixUpsweep)
 UPSWEEP(uint32_t, uint32_t, RadixUpsweep)
 
 DOWNSWEEP(uint8_t, uint8_t, RadixDownsweep)
+DOWNSWEEP(half, ushort, RadixDownsweep)
 DOWNSWEEP(float, uint32_t, RadixDownsweep)
 DOWNSWEEP(uint32_t, uint32_t, RadixDownsweep)
+
+#if defined(__HAVE_BFLOAT__)
+UPSWEEP(bfloat, ushort, RadixUpsweep)
+DOWNSWEEP(bfloat, ushort, RadixDownsweep)
+#endif
 )"
