@@ -280,8 +280,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, resc.numScanThreads, resc.numDownsweepThreads, resc.downsweepSharedSize, resc.downsweepKeysPerThread, resc.numElemInPartition);
 
     uint32_t* shift = static_cast<uint32_t*>(radixShift->contents());
-    // for (uint32_t pass = 0; pass < numPasses; ++pass) {
-    for (uint32_t pass = 0; pass < 1; ++pass) {
+    for (uint32_t pass = 0; pass < numPasses; ++pass) {
+    // for (uint32_t pass = 1; pass < 2; ++pass) {
         *shift = pass * 8;
         printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses - 1, *shift);
 
@@ -303,7 +303,8 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                 else
                     printf("[%u %u] ", i, sortData[i]);
             }
-            for(uint32_t i=size - 1; i > size - 32; --i) {
+            printf(" ... ... ");
+            for(uint32_t i=size - 32; i < size; ++i) {
                 if constexpr (std::is_same<T, float>::value)
                     printf("[%u %f] ", i, sortData[i]);
                 // else if constexpr (std::is_same<T, half>::value)
@@ -392,8 +393,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             printf("Pass hist validation: %s\n", passHistError ? "FAIL" : "PASS");
 
             bool globalHistError = false;
+            uint32_t* gpuCurrent = gpuGlobHist + RADIX * pass;
             for(uint32_t i=0; i<RADIX; ++i) {
-                if(cpuGlobHist[i] != gpuGlobHist[i]) {
+                if(cpuGlobHist[i] != gpuCurrent[i]) {
                     if(!globalHistError)
                         printf("Validating `globalHist`\n");
                     errors++;
@@ -567,9 +569,9 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             break;
         }
 
-        // TODO
-        // std::swap(d_sort, d_sortAlt);
-        // std::swap(d_idx, d_idxAlt);
+        std::swap(d_sort, d_sortAlt);
+        if (withId)
+            std::swap(d_idx, d_idxAlt);
     }
 
     return errors;
@@ -582,68 +584,68 @@ int main() {
     // First, test for UpsweepKernel is good?
     for(uint32_t i = 0; i < N; i++) {
     // for(uint32_t i = 1; i < 2; i++) {
-        // {
-        //     printf("`uint32_t`: Validation (sequential)\n");
-        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i]);
-        //     if(errors > 0){
-        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`uint32_t`: Validation (sequential)\n");
+            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i]);
+            if(errors > 0){
+                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`uint32_t`: Validation (sequential argsort)\n");
-        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], true, true);
-        //     if(errors > 0){
-        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`uint32_t`: Validation (sequential argsort)\n");
+            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], true, true);
+            if(errors > 0){
+                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`uint32_t`: Validation (random)\n");
-        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`uint32_t`: Validation (random)\n");
+            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`uint32_t`: Validation (random argsort)\n");
-        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false, true);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`uint32_t`: Validation (random argsort)\n");
+            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false, true);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`float`: Validation (sequential)\n");
-        //     uint32_t errors = validate<float, uint32_t>(sizes[i]);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`float`: Validation (sequential)\n");
+            uint32_t errors = validate<float, uint32_t>(sizes[i]);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`float`: Validation (sequential argsort)\n");
-        //     uint32_t errors = validate<float, uint32_t>(sizes[i], true, true);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`float`: Validation (sequential argsort)\n");
+            uint32_t errors = validate<float, uint32_t>(sizes[i], true, true);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`float`: Validation (random)\n");
-        //     uint32_t errors = validate<float, uint32_t>(sizes[i], false);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`float`: Validation (random)\n");
+            uint32_t errors = validate<float, uint32_t>(sizes[i], false);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
         {
             printf("`float`: Validation (random argsort)\n");
@@ -654,23 +656,23 @@ int main() {
             }
         }
 
-        // {
-        //     printf("`uint8_t`: Validation (random)\n");
-        //     uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`uint8_t`: Validation (random)\n");
+            uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
-        // {
-        //     printf("`uint8_t`: Validation (random argsort)\n");
-        //     uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false, true);
-        //     if(errors > 0) {
-        //         printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
-        //         break;
-        //     }
-        // }
+        {
+            printf("`uint8_t`: Validation (random argsort)\n");
+            uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false, true);
+            if(errors > 0) {
+                printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
+                break;
+            }
+        }
 
         // {
         //     printf("`float16`: Validation (random)\n");
