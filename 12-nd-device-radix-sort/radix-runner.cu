@@ -194,7 +194,7 @@ struct Resources {
         res.numPartitions   = (size + res.numElemInPartition - 1) / res.numElemInPartition;
         res.numUpsweepThreads = ((size + res.numPartitions - 1) / res.numPartitions + LANE_MASK) & ~LANE_MASK;
         res.numScanThreads    = (res.numPartitions + LANE_MASK) & ~LANE_MASK;
-        res.downsweepKeysPerThread = min(res.numElemInPartition/ res.numDownsweepThreads, BIN_KEYS_PER_THREAD);
+        res.downsweepKeysPerThread = min((res.numElemInPartition + res.numDownsweepThreads - 1)/ res.numDownsweepThreads, BIN_KEYS_PER_THREAD);
         res.downsweepSharedSize = (res.numElemInPartition + (WARP_SIZE * res.downsweepKeysPerThread) - 1) / ( WARP_SIZE * res.downsweepKeysPerThread ) * RADIX;
 
         return res;

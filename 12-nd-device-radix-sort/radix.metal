@@ -62,11 +62,12 @@ inline uchar toBits<uint8_t, uint8_t>(uint8_t val) {
 // Explicit specialization for float
 template<>
 inline uint32_t toBits<float, uint32_t>(float val) {
-    if (metal::isfinite(val)) {
+    if (isfinite(val)) {
         uint32_t bits = as_type<uint32_t>(val);  // Metal's bit casting
         return (bits & 0x80000000) ? ~bits : bits ^ 0x80000000;
     }
-    return metal::isnan(val) || val > 0.0f ? 0xFFFFFFFF : 0;
+
+    return isnan(val) || val > 0.0 ? 0xFFFFFFFF : 0;
 }
 
 // Explicit specialization for uint32_t
@@ -162,18 +163,6 @@ template<>
 inline uint8_t getTypeMax() {
     return 0xFF; // 255
 }
-
-/*
-template<>
-inline half getTypeMax() {
-    return 0xFF; // 255
-}
-
-template<>
-inlint bfloat getTypeMax() {
-    return 0xFF; // 255
-}
-*/
 
 template<>
 inline float getTypeMax() {
@@ -372,7 +361,7 @@ METAL_FUNC void RadixDownsweep(
     uint threadIdx [[thread_position_in_threadgroup]],
     uint laneIdx   [[thread_index_in_simdgroup]],
     uint simdIdx   [[simdgroup_index_in_threadgroup]],
-    uint groupIdx  [[threadgroup_position_in_grid]],
+    uint groupIdx  [[threadgroup_index_in_grid]],
     uint groupDim  [[threads_per_threadgroup]],
     uint gridDim   [[threadgroups_per_grid]]
 ) {
@@ -514,6 +503,7 @@ METAL_FUNC void RadixDownsweep(
         return;
     threadgroup_barrier(mem_flags::mem_device); // this is required only if we proceed with sorting of indices
 
+    /*
     // `s_tmp` has done with it's job as warp histogram bookkeeper & keys
     // let's re-use it for our vals
     threadgroup uint32_t* s_vals = reinterpret_cast<threadgroup uint32_t*>(s_tmp);
@@ -539,6 +529,7 @@ METAL_FUNC void RadixDownsweep(
             valsAlt[s_localHistogram[digits[i]] + t] = s_vals[t];
         }
     }
+    */
 }
 
 #define UPSWEEP(T, U, name)                                   \
