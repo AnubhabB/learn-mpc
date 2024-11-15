@@ -292,29 +292,29 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
             // Get current data being sorted
             T* sortData = static_cast<T*>(d_sort->contents());
-            printf("Sort data now: \n");
-            for(uint32_t i=0; i<32; ++i) {
-                if constexpr (std::is_same<T, float>::value)
-                    printf("[%u %f] ", i, sortData[i]);
-                // else if constexpr (std::is_same<T, half>::value)
-                //     printf("[%u %f] ", i, __half2float(sortData[i]));
-                // else if constexpr (std::is_same<T, nv_bfloat16>::value)
-                //     printf("[%u %f] ", i, __bfloat162float(sortData[i]));
-                else
-                    printf("[%u %u] ", i, sortData[i]);
-            }
-            printf(" ... ... ");
-            for(uint32_t i=size - 32; i < size; ++i) {
-                if constexpr (std::is_same<T, float>::value)
-                    printf("[%u %f] ", i, sortData[i]);
-                // else if constexpr (std::is_same<T, half>::value)
-                //     printf("[%u %f] ", i, __half2float(sortData[i]));
-                // else if constexpr (std::is_same<T, nv_bfloat16>::value)
-                //     printf("[%u %f] ", i, __bfloat162float(sortData[i]));
-                else
-                    printf("[%u %u] ", i, sortData[i]);
-            }
-            printf("\n");
+            // printf("Sort data now: \n");
+            // for(uint32_t i=0; i<32; ++i) {
+            //     if constexpr (std::is_same<T, float>::value)
+            //         printf("[%u %f] ", i, sortData[i]);
+            //     // else if constexpr (std::is_same<T, half>::value)
+            //     //     printf("[%u %f] ", i, __half2float(sortData[i]));
+            //     // else if constexpr (std::is_same<T, nv_bfloat16>::value)
+            //     //     printf("[%u %f] ", i, __bfloat162float(sortData[i]));
+            //     else
+            //         printf("[%u %u] ", i, sortData[i]);
+            // }
+            // printf(" ... ... ");
+            // for(uint32_t i=size - 32; i < size; ++i) {
+            //     if constexpr (std::is_same<T, float>::value)
+            //         printf("[%u %f] ", i, sortData[i]);
+            //     // else if constexpr (std::is_same<T, half>::value)
+            //     //     printf("[%u %f] ", i, __half2float(sortData[i]));
+            //     // else if constexpr (std::is_same<T, nv_bfloat16>::value)
+            //     //     printf("[%u %f] ", i, __bfloat162float(sortData[i]));
+            //     else
+            //         printf("[%u %u] ", i, sortData[i]);
+            // }
+            // printf("\n");
 
             MTL::ComputeCommandEncoder* upsweepEncoder = cmdBuffer->computeCommandEncoder();
             upsweepEncoder->setComputePipelineState(_upsweepState);
