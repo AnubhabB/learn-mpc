@@ -521,6 +521,40 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
             cmdBuffer->commit();
             cmdBuffer->waitUntilCompleted();
+
+            T* sortPass = static_cast<T*>(d_sortAlt->contents());
+
+            bool passError = false;
+            for(uint32_t i=1; i<size; ++i) {
+                // Basically at every stage target bits[prev] < bits[current]
+                U prev = toBitsCpu<T, U>(sortPass[i - 1]) >> *shift & RADIX_MASK;
+                U curr = toBitsCpu<T, U>(sortPass[i]) >> *shift & RADIX_MASK;
+
+                if(prev > curr) {
+                    if(!passError) {
+                        printf("Validating `sortAlt` after Downsweep: pass[%u]\n", pass);
+                    }
+                    if(errors < 32) {
+                        printf("Error[%u]@pass[%u]: ", i, pass);
+                        if constexpr (std::is_same<T, float>::value)
+                            printf("Prev[%f %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        // else if constexpr (std::is_same<T, half>::value)
+                        //     printf("Prev[%f %u] This[%f %u]", __half2float(sortPass[i - 1]), prev, __half2float(sortPass[i]), curr);
+                        // else if constexpr (std::is_same<T, nv_bfloat16>::value)
+                        //     printf("Prev[%f %u] This[%f %u]", __bfloat162float(sortPass[i - 1]), prev, __bfloat162float(sortPass[i]), curr);
+                        else if constexpr (std::is_same<T, uint32_t>::value)
+                            printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        else if constexpr (std::is_same<T, uint8_t>::value)
+                            printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
+                        // else if constexpr (std::is_same<T, int64_t>::value)
+                        //     printf("Prev[%ld %u] This[%ld %u]", (long)sortPass[i - 1], prev, (long)sortPass[i], curr);
+                        printf("\n");
+                    }
+                    errors += 1;
+                    passError = true;
+                }
+            }
+            printf("Sort data validation after `Downsweep` pass[%u]: %s\n", pass, passError ? "FAIL" : "PASS");
         }
 
         // Commit and wait for completion
