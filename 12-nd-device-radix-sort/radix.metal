@@ -63,26 +63,24 @@ inline uchar toBits<uint8_t, uint8_t>(uint8_t val) {
 template<>
 inline ushort toBits<half, ushort>(half val) {
     if (isfinite(val)) {
-        uint32_t bits = as_type<ushort>(val);  // Metal's bit casting
+        ushort bits = as_type<ushort>(val);  // Metal's bit casting
         return static_cast<ushort>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
     }
 
     return isnan(val) || val > 0.0 ? 0xFFFF : 0;
 }
 
-/*
 #if defined(__HAVE_BFLOAT__)
 template<>
 inline ushort toBits<bfloat, ushort>(bfloat val) {
     if (isfinite(val)) {
-        uint32_t bits = as_type<ushort>(val);  // Metal's bit casting
+        ushort bits = as_type<ushort>(val);  // Metal's bit casting
         return static_cast<ushort>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
     }
 
     return isnan(val) || val > 0.0 ? 0xFFFF : 0;
 }
 #endif
-*/
 
 // Explicit specialization for float
 template<>
@@ -154,6 +152,44 @@ struct VectorLoad<float, uint32_t> {
         };
     }
 };
+
+// Specialization for half
+template<>
+struct VectorLoad<half, ushort> {
+    static Vectorized<ushort> load(const device half* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const device half* aligned_ptr = data + idx;
+        // Do vectorized load using Metal's vector type
+        half4 vec = *reinterpret_cast<const device half4*>(aligned_ptr);
+
+        return Vectorized<ushort>{
+            toBits<half, ushort>(vec.x),
+            toBits<half, ushort>(vec.y),
+            toBits<half, ushort>(vec.z),
+            toBits<half, ushort>(vec.w)
+        };
+    }
+};
+
+#if defined(__HAVE_BFLOAT__)
+// Specialization for bfloat
+template<>
+struct VectorLoad<bfloat, ushort> {
+    static Vectorized<ushort> load(const device bfloat* data, uint32_t idx) {
+        // Create aligned pointer to starting address
+        const device bfloat* aligned_ptr = data + idx;
+        // Do vectorized load using Metal's vector type
+        bfloat4 vec = *reinterpret_cast<const device bfloat4*>(aligned_ptr);
+
+        return Vectorized<ushort>{
+            toBits<bfloat, ushort>(vec.x),
+            toBits<bfloat, ushort>(vec.y),
+            toBits<bfloat, ushort>(vec.z),
+            toBits<bfloat, ushort>(vec.w)
+        };
+    }
+};
+#endif
 
 // Specialization for uint8_t
 template<>

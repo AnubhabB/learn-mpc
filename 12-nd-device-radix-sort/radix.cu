@@ -92,14 +92,14 @@ __device__ inline U toBits(T val) {
         }
 
         return isnan(val) || val > 0.0f ? 0xFFFFFFFF : 0;
-    } else if constexpr (std::is_same<T, half>::value) {
+    } else if constexpr (std::is_same<T, __half>::value) {
         if (!__hisinf(val)) {  // need to convert to float for isfinite
             uint16_t bits = __half_as_ushort(val);  // get raw bits of half
             return static_cast<U>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
         }
 
         return __hisnan(val) || val > CUDART_ZERO_FP16 ? 0xFFFF : 0;
-    } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+    } else if constexpr (std::is_same<T, __nv_bfloat16>::value) {
         if (!__hisinf(val)) {  // need to convert to float for isfinite
             uint16_t bits = __bfloat16_as_ushort(val);
             return static_cast<U>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is still the sign bit

@@ -51,20 +51,20 @@ inline float random_range(float min, float max) {
     return min + random_float() * (max - min);
 }
 
-// // Specialization for half float if needed
-// template<>
-// inline half random_range(half min, half max) {
-//     float min_f = __half2float(min);
-//     float max_f = __half2float(max);
-//     return __float2half(min_f + random_float() * (max_f - min_f));
-// }
+// Specialization for half float if needed
+template<>
+inline __fp16 random_range(__fp16 min, __fp16 max) {
+    float min_f = float(min);
+    float max_f = float(max);
+    return __fp16(min_f + random_float() * (max_f - min_f));
+}
 
-// // Specialization for half float if needed
+// Specialization for half float if needed
 // template<>
-// inline nv_bfloat16 random_range(nv_bfloat16 min, nv_bfloat16 max) {
-//     float min_f = __bfloat162float(min);
-//     float max_f = __bfloat162float(max);
-//     return __float2bfloat16(min_f + random_float() * (max_f - min_f));
+// inline __bf16 random_range(__bf16 min, __bf16 max) {
+//     float min_f = float(min);
+//     float max_f = float(max);
+//     return __bf16(min_f + random_float() * (max_f - min_f));
 // }
 
 // Helper functions for bit conversions
@@ -74,14 +74,20 @@ inline U toBitsCpu(T val) {
         uint32_t fuint;
         memcpy(&fuint, &val, sizeof(float));
         return (fuint & 0x80000000) ? ~fuint : fuint ^ 0x80000000;
-    // } else if constexpr (std::is_same<T, half>::value) {
-    //     ushort bits = __half_as_ushort(val);
-    //     return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is sign bit for 16-bit
-    // } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
-    //     ushort bits = __bfloat16_as_ushort(val);
-    //     return (bits & 0x8000) ? ~bits : bits ^ 0x8000;  // 0x8000 is still the sign bit
-    // } else if constexpr (std::is_same<T, int64_t>::value) {
-    //     return static_cast<U>(val) ^ 0x8000000000000000;
+    } else if constexpr (std::is_same<T, __fp16>::value) {
+        if (std::isfinite(static_cast<float>(val))) {
+            ushort bits = *reinterpret_cast<ushort*>(&val);
+            return static_cast<ushort>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
+        }
+
+        return isnan(val) || val > 0.0 ? 0xFFFF : 0;
+    // } else if constexpr (std::is_same<T, __bf16>::value) {
+    //     if (std::isfinite(static_cast<float>(val))) {
+    //         ushort bits = *reinterpret_cast<ushort*>(&val);
+    //         return static_cast<ushort>((bits & 0x8000) ? ~bits : bits ^ 0x8000);  // 0x8000 is sign bit for 16-bit
+    //     }
+
+    //     return isnan(val) || val > 0.0 ? 0xFFFF : 0;
     } else {
         return static_cast<U>(val);
     }
@@ -103,13 +109,14 @@ bool createData(uint32_t size, T* d_sort, uint32_t* d_idx, bool seq, bool withId
             min = (uint32_t)0;
             max = size <= 1024 ? 64 : (uint32_t)320000;
         } else if constexpr (std::is_same<T, float>::value) {
-            min = -255.0f;
-            max = 255.0f;
-        // } else if constexpr (std::is_same<T, half>::value) {
-        //     min = -CUDART_MAX_NORMAL_FP16;
-        //     max = CUDART_MAX_NORMAL_FP16;
-        // } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
-        //     min = __float2bfloat16(-6000000.0f);
+            min = -128000.0f;
+            max = 128000.0f;
+        } else if constexpr (std::is_same<T, __fp16>::value) {
+            min = -24000.0;
+            max = 24000.0;
+        // } else if constexpr (std::is_same<T, __bf16>::value) {
+        //     min = -255.0;
+        //     max = 255.0;;
         //     max = __float2bfloat16(6000000.0f);
         // } else if constexpr (std::is_same<T, int64_t>::value) {
         //     min = INT64_MIN;
@@ -198,7 +205,12 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     } else if constexpr (std::is_same<T, float>::value) {
         strcpy(upsweepFn, "RadixUpsweep_float_uint32_t");
         strcpy(downsweepFn, "RadixDownsweep_float_uint32_t");
-
+    } else if constexpr (std::is_same<T, __fp16>::value) {
+        strcpy(upsweepFn, "RadixUpsweep_half_ushort");
+        strcpy(downsweepFn, "RadixDownsweep_half_ushort");
+    // } else if constexpr (std::is_same<T, __bf16>::value) {
+    //     strcpy(upsweepFn, "RadixUpsweep_bfloat_ushort");
+    //     strcpy(downsweepFn, "RadixDownsweep_bfloat_ushort");
     }
 
     MTL::Function* _up   = library->newFunction( NS::String::string(upsweepFn, NS::UTF8StringEncoding) );
@@ -282,19 +294,22 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
 
     printf("For size[%u]\n---------------\nnumPartitions: %u\nnumUpsweepThreads: %u\nnumScanThreads: %u\nnumDownsweepThreads: %u\ndownsweepSharedSize: %u\ndownsweepKeysPerThreade: %u\nmaxNumElementsInBlock: %u\n\n", size, resc.numPartitions, _nUpThreads, resc.numScanThreads, resc.numDownsweepThreads, resc.downsweepSharedSize, resc.downsweepKeysPerThread, resc.numElemInPartition);
 
+    // MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+
     uint32_t* shift = static_cast<uint32_t*>(radixShift->contents());
     for (uint32_t pass = 0; pass < numPasses; ++pass) {
     // for (uint32_t pass = 1; pass < 2; ++pass) {
+        MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
         *shift = pass * 8;
         printf("Pass[%u/ %u] Shift[%u]\n", pass, numPasses - 1, *shift);
 
         // The upsweep kernel call
         {
             // Create a command buffer and a compute encoder from the buffer
-            MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+            // MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
 
             // Get current data being sorted
-            T* sortData = static_cast<T*>(d_sort->contents());
+            // T* sortData = static_cast<T*>(d_sort->contents());
             // printf("Sort data now: \n");
             // for(uint32_t i=0; i<32; ++i) {
             //     if constexpr (std::is_same<T, float>::value)
@@ -334,83 +349,83 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             upsweepEncoder->endEncoding();
 
             // // Commit and wait for completion
-            cmdBuffer->commit();
-            cmdBuffer->waitUntilCompleted();
+            // cmdBuffer->commit();
+            // cmdBuffer->waitUntilCompleted();
 
-            uint32_t *cpuGlobHist = (uint32_t*)malloc(radixSize);
-            uint32_t *gpuGlobHist = static_cast<uint32_t*>(d_globalHist->contents());
-            uint32_t *cpuPassHist = (uint32_t*)malloc(radixSize * resc.numPartitions);
-            uint32_t *gpuPassHist = static_cast<uint32_t*>(d_passHist->contents());
+            // uint32_t *cpuGlobHist = (uint32_t*)malloc(radixSize);
+            // uint32_t *gpuGlobHist = static_cast<uint32_t*>(d_globalHist->contents());
+            // uint32_t *cpuPassHist = (uint32_t*)malloc(radixSize * resc.numPartitions);
+            // uint32_t *gpuPassHist = static_cast<uint32_t*>(d_passHist->contents());
 
             // Initialize all zeroes
-            for(int i=0; i<RADIX; ++i) {
-                cpuGlobHist[i] = 0;
-                uint32_t offset = i * resc.numPartitions;
-                for(int j=0; j<resc.numPartitions; ++j) {
-                    cpuPassHist[offset + j] = 0;
-                }
-            }
+            // for(int i=0; i<RADIX; ++i) {
+            //     cpuGlobHist[i] = 0;
+            //     uint32_t offset = i * resc.numPartitions;
+            //     for(int j=0; j<resc.numPartitions; ++j) {
+            //         cpuPassHist[offset + j] = 0;
+            //     }
+            // }
 
-            // Compute CPU histogram
-            for (uint32_t i = 0; i < size; i++) {
-                uint32_t bits = toBitsCpu<T, U>(sortData[i]);
-                uint32_t digit = (bits >> *shift) & RADIX_MASK;
-                cpuGlobHist[digit]++;
-            }
-            // Convert to exclusive prefix sum
-            uint32_t prev = 0;
-            for (uint32_t i = 0; i < RADIX; i++) {
-                uint32_t current = cpuGlobHist[i];
-                cpuGlobHist[i] = prev;
-                prev += current;
-            }
-            // Crea
-            for(uint32_t i = 0; i<resc.numPartitions; ++i) {
-                uint32_t blockstart = i * resc.numElemInPartition;
-                uint32_t blockend   = min(blockstart + resc.numElemInPartition, size);
+            // // Compute CPU histogram
+            // for (uint32_t i = 0; i < size; i++) {
+            //     uint32_t bits = toBitsCpu<T, U>(sortData[i]);
+            //     uint32_t digit = (bits >> *shift) & RADIX_MASK;
+            //     cpuGlobHist[digit]++;
+            // }
+            // // Convert to exclusive prefix sum
+            // uint32_t prev = 0;
+            // for (uint32_t i = 0; i < RADIX; i++) {
+            //     uint32_t current = cpuGlobHist[i];
+            //     cpuGlobHist[i] = prev;
+            //     prev += current;
+            // }
+            // // Crea
+            // for(uint32_t i = 0; i<resc.numPartitions; ++i) {
+            //     uint32_t blockstart = i * resc.numElemInPartition;
+            //     uint32_t blockend   = min(blockstart + resc.numElemInPartition, size);
 
-                for(uint32_t j=blockstart; j < blockend; ++j) {
-                    uint32_t bits = toBitsCpu<T, U>(sortData[j]);
-                    bits = ((bits >> *shift) & RADIX_MASK);
-                    uint32_t trgt = bits * resc.numPartitions + i;
-                    cpuPassHist[trgt] += 1;
-                }
-            }
+            //     for(uint32_t j=blockstart; j < blockend; ++j) {
+            //         uint32_t bits = toBitsCpu<T, U>(sortData[j]);
+            //         bits = ((bits >> *shift) & RADIX_MASK);
+            //         uint32_t trgt = bits * resc.numPartitions + i;
+            //         cpuPassHist[trgt] += 1;
+            //     }
+            // }
 
-            bool passHistError = false;
-            for(uint32_t block=0; block < resc.numPartitions; ++block) {
-                uint32_t offset = block * RADIX;
+            // bool passHistError = false;
+            // for(uint32_t block=0; block < resc.numPartitions; ++block) {
+            //     uint32_t offset = block * RADIX;
 
-                for(uint32_t digit=0; digit < RADIX; digit++) {
-                    uint32_t v_idx = offset + digit;
-                    if(cpuPassHist[v_idx] != gpuPassHist[v_idx]) {
-                        if(!passHistError)
-                            printf("Validating `passHist`\n");
-                        errors++;
-                        passHistError = true;
-                        if(errors < 10)
-                            printf("Error @ Block[%u] Digit[%u]: Cpu[%u] Gpu[%u]\n", block, digit, cpuPassHist[v_idx], gpuPassHist[v_idx]);
-                    }
-                }
-            }
-            printf("Pass hist validation: %s\n", passHistError ? "FAIL" : "PASS");
+            //     for(uint32_t digit=0; digit < RADIX; digit++) {
+            //         uint32_t v_idx = offset + digit;
+            //         if(cpuPassHist[v_idx] != gpuPassHist[v_idx]) {
+            //             if(!passHistError)
+            //                 printf("Validating `passHist`\n");
+            //             errors++;
+            //             passHistError = true;
+            //             if(errors < 10)
+            //                 printf("Error @ Block[%u] Digit[%u]: Cpu[%u] Gpu[%u]\n", block, digit, cpuPassHist[v_idx], gpuPassHist[v_idx]);
+            //         }
+            //     }
+            // }
+            // printf("Pass hist validation: %s\n", passHistError ? "FAIL" : "PASS");
 
-            bool globalHistError = false;
-            uint32_t* gpuCurrent = gpuGlobHist + RADIX * pass;
-            for(uint32_t i=0; i<RADIX; ++i) {
-                if(cpuGlobHist[i] != gpuCurrent[i]) {
-                    if(!globalHistError)
-                        printf("Validating `globalHist`\n");
-                    errors++;
-                    globalHistError = true;
-                    if(errors < 32)
-                        printf("Error @ Digit[%u]: Cpu[%u] Gpu[%u]\n", i, cpuGlobHist[i], gpuGlobHist[i]);
-                }
-            }
-            printf("Global hist validation: %s\n", globalHistError ? "FAIL" : "PASS");
+            // bool globalHistError = false;
+            // uint32_t* gpuCurrent = gpuGlobHist + RADIX * pass;
+            // for(uint32_t i=0; i<RADIX; ++i) {
+            //     if(cpuGlobHist[i] != gpuCurrent[i]) {
+            //         if(!globalHistError)
+            //             printf("Validating `globalHist`\n");
+            //         errors++;
+            //         globalHistError = true;
+            //         if(errors < 32)
+            //             printf("Error @ Digit[%u]: Cpu[%u] Gpu[%u]\n", i, cpuGlobHist[i], gpuGlobHist[i]);
+            //     }
+            // }
+            // printf("Global hist validation: %s\n", globalHistError ? "FAIL" : "PASS");
             
-            free(cpuGlobHist);
-            free(cpuPassHist);
+            // free(cpuGlobHist);
+            // free(cpuPassHist);
         }
 
         // Launch RadixScan kernel
@@ -418,11 +433,11 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             uint32_t pass_hist_size = radixSize * resc.numPartitions;
 
             // Create a command buffer and a compute encoder from the buffer
-            MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+            // MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
 
-            uint32_t* passHistGpu = static_cast<uint32_t*>(d_passHist->contents());
-            uint32_t* passHistBefore = (uint32_t*)malloc(pass_hist_size);
-            memcpy(passHistBefore, passHistGpu, pass_hist_size);
+            // uint32_t* passHistGpu = static_cast<uint32_t*>(d_passHist->contents());
+            // uint32_t* passHistBefore = (uint32_t*)malloc(pass_hist_size);
+            // memcpy(passHistBefore, passHistGpu, pass_hist_size);
 
             // printf("\nBEFORE ==================\n");
             // for(uint32_t i=0; i<32; ++i) {
@@ -441,64 +456,64 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             scanEncoder->endEncoding();
 
             // // Commit and wait for completion
-            cmdBuffer->commit();
-            cmdBuffer->waitUntilCompleted();
+            // cmdBuffer->commit();
+            // cmdBuffer->waitUntilCompleted();
 
-            // printf("\nAFTER ==================\n");
-            // for(uint32_t i=0; i<32; ++i) {
-            //     printf("[%u %u] ", i, passHistGpu[i]);
+            // // printf("\nAFTER ==================\n");
+            // // for(uint32_t i=0; i<32; ++i) {
+            // //     printf("[%u %u] ", i, passHistGpu[i]);
+            // // }
+            // // printf("\n========================\n");
+            // uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
+            // // Create cpu alternate values
+            // // Process each partition separately
+            // // For each digit
+            // for(uint32_t dgt=0; dgt<RADIX; ++dgt) {
+            //     uint32_t sum = 0;
+            //     uint32_t offst = dgt * resc.numPartitions;
+
+            //     for(uint32_t blk=0; blk<resc.numPartitions; ++blk) {
+            //         uint32_t trgt = blk + offst;
+            //         passHistCpu[trgt] = sum;
+            //         sum += passHistBefore[trgt];
+            //     }
             // }
-            // printf("\n========================\n");
-            uint32_t* passHistCpu = (uint32_t*)malloc(pass_hist_size);
-            // Create cpu alternate values
-            // Process each partition separately
-            // For each digit
-            for(uint32_t dgt=0; dgt<RADIX; ++dgt) {
-                uint32_t sum = 0;
-                uint32_t offst = dgt * resc.numPartitions;
 
-                for(uint32_t blk=0; blk<resc.numPartitions; ++blk) {
-                    uint32_t trgt = blk + offst;
-                    passHistCpu[trgt] = sum;
-                    sum += passHistBefore[trgt];
-                }
-            }
+            // bool passHistError = false;
+            // for (uint32_t digit = 0; digit < RADIX; ++digit) {
+            //     uint32_t offset = digit * resc.numPartitions;
+            //     for(uint32_t block=0; block < resc.numPartitions; ++block) {
+            //         uint32_t trgt = offset + block;
+            //         // if(digit < 6)
+            //         //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
+            //         if(passHistCpu[trgt] != passHistGpu[trgt]) {
+            //             if(!passHistError) {
+            //                 printf("Validating `passHist` after scan\n");
+            //             }
+            //             errors += 1;
+            //             passHistError = true;
+            //             if(errors < 16) {
+            //                 printf("Mismatch at digit %u, block %u: GPU = %u, CPU = %u\n", digit, block, passHistGpu[trgt], passHistCpu[trgt]);
+            //                 printf("Peeking digit %u in passHist: \n", digit);
+            //                 for(uint32_t blk=0; blk<resc.numPartitions; ++blk) {
+            //                     uint32_t trg = digit * resc.numPartitions + blk;
+            //                     printf("[%u %u] ", blk, passHistBefore[trg]);
+            //                 }
+            //                 printf("\n");
+            //             }
+            //         }
+            //     }
+            // }
+            // printf("Pass hist validation after `Scan`: %s\n", passHistError ? "FAIL" : "PASS");
 
-            bool passHistError = false;
-            for (uint32_t digit = 0; digit < RADIX; ++digit) {
-                uint32_t offset = digit * resc.numPartitions;
-                for(uint32_t block=0; block < resc.numPartitions; ++block) {
-                    uint32_t trgt = offset + block;
-                    // if(digit < 6)
-                    //     printf("Block[%u] CpuDig[%u]: %u\n", block, digit, passHistCpu[trgt]);
-                    if(passHistCpu[trgt] != passHistGpu[trgt]) {
-                        if(!passHistError) {
-                            printf("Validating `passHist` after scan\n");
-                        }
-                        errors += 1;
-                        passHistError = true;
-                        if(errors < 16) {
-                            printf("Mismatch at digit %u, block %u: GPU = %u, CPU = %u\n", digit, block, passHistGpu[trgt], passHistCpu[trgt]);
-                            printf("Peeking digit %u in passHist: \n", digit);
-                            for(uint32_t blk=0; blk<resc.numPartitions; ++blk) {
-                                uint32_t trg = digit * resc.numPartitions + blk;
-                                printf("[%u %u] ", blk, passHistBefore[trg]);
-                            }
-                            printf("\n");
-                        }
-                    }
-                }
-            }
-            printf("Pass hist validation after `Scan`: %s\n", passHistError ? "FAIL" : "PASS");
-
-            free(passHistBefore);
-            free(passHistCpu);
+            // free(passHistBefore);
+            // free(passHistCpu);
         }
 
         // Finally the downsweep kernel
         {
             // Create a command buffer and a compute encoder from the buffer
-            MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
+            // MTL::CommandBuffer* cmdBuffer = cmdQueue->commandBuffer();
             MTL::ComputeCommandEncoder* downEncoder = cmdBuffer->computeCommandEncoder();
             downEncoder->setComputePipelineState(_downsweepState);
             downEncoder->setBuffer(d_sort, 0, 0);
@@ -520,52 +535,61 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             downEncoder->dispatchThreadgroups(upDownGroupsPerGrid, downThreadsPerGroup);
             downEncoder->endEncoding();
 
-            cmdBuffer->commit();
-            cmdBuffer->waitUntilCompleted();
+            /****************
+             * 
+             * Uncomment the following for validating the `downsweep` pass
+             * 
+            ****************/
+            // cmdBuffer->commit();
+            // cmdBuffer->waitUntilCompleted();
 
-            T* sortPass = static_cast<T*>(d_sortAlt->contents());
+            // T* sortPass = static_cast<T*>(d_sortAlt->contents());
             // uint32_t* idxPass = static_cast<uint32_t*>(d_idxAlt->contents());
 
             // for(uint32_t i=0; i<size; ++i) {
             //     printf("[%u %f] ", i, sortPass[i]);
             // }
 
-            bool passError = false;
-            for(uint32_t i=1; i<size; ++i) {
-                // Basically at every stage target bits[prev] < bits[current]
-                U prev = toBitsCpu<T, U>(sortPass[i - 1]) >> *shift & RADIX_MASK;
-                U curr = toBitsCpu<T, U>(sortPass[i]) >> *shift & RADIX_MASK;
+            // bool passError = false;
+            // for(uint32_t i=1; i<size; ++i) {
+            //     // Basically at every stage target bits[prev] < bits[current]
+            //     U prev = toBitsCpu<T, U>(sortPass[i - 1]) >> *shift & RADIX_MASK;
+            //     U curr = toBitsCpu<T, U>(sortPass[i]) >> *shift & RADIX_MASK;
 
-                if(prev > curr) {
-                    if(!passError) {
-                        printf("Validating `sortAlt` after Downsweep: pass[%u]\n", pass);
-                    }
-                    if(errors < 32) {
-                        printf("Error[%u]@pass[%u]: ", i, pass);
-                        if constexpr (std::is_same<T, float>::value)
-                            printf("Prev[%f %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
-                        // else if constexpr (std::is_same<T, half>::value)
-                        //     printf("Prev[%f %u] This[%f %u]", __half2float(sortPass[i - 1]), prev, __half2float(sortPass[i]), curr);
-                        // else if constexpr (std::is_same<T, nv_bfloat16>::value)
-                        //     printf("Prev[%f %u] This[%f %u]", __bfloat162float(sortPass[i - 1]), prev, __bfloat162float(sortPass[i]), curr);
-                        else if constexpr (std::is_same<T, uint32_t>::value)
-                            printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
-                        else if constexpr (std::is_same<T, uint8_t>::value)
-                            printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
-                        // else if constexpr (std::is_same<T, int64_t>::value)
-                        //     printf("Prev[%ld %u] This[%ld %u]", (long)sortPass[i - 1], prev, (long)sortPass[i], curr);
-                        printf("\n");
-                    }
-                    errors += 1;
-                    passError = true;
-                }
-            }
-            printf("Sort data validation after `Downsweep` pass[%u]: %s\n", pass, passError ? "FAIL" : "PASS");
+            //     if(prev > curr) {
+            //         if(!passError) {
+            //             printf("Validating `sortAlt` after Downsweep: pass[%u]\n", pass);
+            //         }
+            //         if(errors < 32) {
+            //             printf("Error[%u]@pass[%u]: ", i, pass);
+            //             if constexpr (std::is_same<T, float>::value)
+            //                 printf("Prev[%f %u] This[%f %u]", sortPass[i - 1], prev, sortPass[i], curr);
+            //             // else if constexpr (std::is_same<T, half>::value)
+            //             //     printf("Prev[%f %u] This[%f %u]", __half2float(sortPass[i - 1]), prev, __half2float(sortPass[i]), curr);
+            //             // else if constexpr (std::is_same<T, nv_bfloat16>::value)
+            //             //     printf("Prev[%f %u] This[%f %u]", __bfloat162float(sortPass[i - 1]), prev, __bfloat162float(sortPass[i]), curr);
+            //             else if constexpr (std::is_same<T, uint32_t>::value)
+            //                 printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
+            //             else if constexpr (std::is_same<T, uint8_t>::value)
+            //                 printf("Prev[%u %u] This[%u %u]", sortPass[i - 1], prev, sortPass[i], curr);
+            //             // else if constexpr (std::is_same<T, int64_t>::value)
+            //             //     printf("Prev[%ld %u] This[%ld %u]", (long)sortPass[i - 1], prev, (long)sortPass[i], curr);
+            //             printf("\n");
+            //         }
+            //         errors += 1;
+            //         passError = true;
+            //     }
+            // }
+            // printf("Sort data validation after `Downsweep` pass[%u]: %s\n", pass, passError ? "FAIL" : "PASS");
+            /****************
+             * 
+             * End of `downsweep` validation
+             * 
+            ****************/
         }
 
-        // Commit and wait for completion
-        // cmdBuffer->commit();
-        // cmdBuffer->waitUntilCompleted();
+        cmdBuffer->commit();
+        cmdBuffer->waitUntilCompleted();
 
         if(errors > 0) {
             printf("Breaking at pass %u\n", pass);
@@ -577,29 +601,12 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
             std::swap(d_idx, d_idxAlt);
     }
 
+    // Commit and wait for completion
+    // cmdBuffer->commit();
+    // cmdBuffer->waitUntilCompleted();
+
     // All passes are done!
     // let's do a final validation of the sort data
-    // T* sorted = (T*)malloc(sortSize);
-    // c_ret = cudaMemcpy(sorted, d_sort, sortSize, cudaMemcpyDeviceToHost);
-    // if(c_ret) {
-    //     errors += 1;
-    //     printf("[Final Validation Data copy] Cuda Error: %s", cudaGetErrorString(c_ret));
-    //     return errors;
-    // }
-
-    // uint32_t* sortedIdx;
-    // if (withId) {
-    //     sortedIdx = (uint32_t*)malloc(idxSize);
-    //     c_ret = cudaMemcpy(sortedIdx, d_idx, idxSize, cudaMemcpyDeviceToHost);
-    //     if (c_ret) {
-    //         errors += 1;
-    //         printf("[Final Validation Idx copy] Cuda Error: %s", cudaGetErrorString(c_ret));
-    //         return errors;
-    //     }
-    // }
-
-    // cudaDeviceSynchronize();
-
     T* sorted = static_cast<T*>(d_sort->contents());
     uint32_t* sortedIdx = static_cast<uint32_t*>(d_idx->contents());
 
@@ -619,10 +626,10 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
                     printf("Prev[%f] This[%f]", sorted[idx - 1], sorted[idx]);
                     if (withId)
                         printf(" Original[%u][%f]", sortedIdx[idx], unsorted[sortedIdx[idx]]);
-                // else if constexpr (std::is_same<T, half>::value)
-                //     printf("Prev[%f] This[%f]", __half2float(sorted[idx - 1]), __half2float(sorted[idx]));
-                // else if constexpr (std::is_same<T, nv_bfloat16>::value)
-                //     printf("Prev[%f] This[%f]", __bfloat162float(sorted[idx - 1]), __bfloat162float(sorted[idx]));
+                else if constexpr (std::is_same<T, __fp16>::value)
+                    printf("Prev[%f] This[%f]", sorted[idx - 1], sorted[idx]);
+                else if constexpr (std::is_same<T, __bf16>::value)
+                    printf("Prev[%f] This[%f]", sorted[idx - 1], sorted[idx]);
                 } else if constexpr (std::is_same<T, uint32_t>::value) {
                     printf("Prev[%u] This[%u]", sorted[idx - 1], sorted[idx]);
                     if (withId)
@@ -643,6 +650,35 @@ uint32_t validate(const uint32_t size, bool dataseq = true, bool withId = false)
     printf("Final sort validation: `%s`\n", isSorted ? "PASS" : "FAIL");
     printf("=========================================================\n");
 
+    // Cleanup buffers
+    if (d_sort)
+        d_sort -> release();
+    if (d_sortAlt)
+        d_sortAlt -> release();
+    if (d_idx)
+        d_idx -> release();
+    if (d_idxAlt)
+        d_idxAlt -> release();
+    if (d_globalHist)
+        d_globalHist -> release();
+    if (d_passHist)
+        d_passHist -> release();
+    
+    // if (cmdBuffer)
+    //     cmdBuffer -> release();
+    if (cmdQueue)
+        cmdQueue -> release();
+
+    if (_upsweepState)
+        _upsweepState -> release();
+    if (_scanState)
+        _scanState -> release();
+    if (_downsweepState)
+        _downsweepState -> release();
+
+    if (library)
+        library -> release();
+
     return errors;
 }
 
@@ -653,59 +689,59 @@ int main() {
     // First, test for UpsweepKernel is good?
     for(uint32_t i = 0; i < N; i++) {
     // for(uint32_t i = 1; i < 2; i++) {
-        {
-            printf("`uint32_t`: Validation (sequential)\n");
-            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i]);
-            if(errors > 0){
-                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`uint32_t`: Validation (sequential)\n");
+        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i]);
+        //     if(errors > 0){
+        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`uint32_t`: Validation (sequential argsort)\n");
-            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], true, true);
-            if(errors > 0){
-                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`uint32_t`: Validation (sequential argsort)\n");
+        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], true, true);
+        //     if(errors > 0){
+        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`uint32_t`: Validation (random)\n");
-            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`uint32_t`: Validation (random)\n");
+        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`uint32_t`: Validation (random argsort)\n");
-            uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false, true);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`uint32_t`: Validation (random argsort)\n");
+        //     uint32_t errors = validate<uint32_t, uint32_t>(sizes[i], false, true);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[uint32_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`float`: Validation (sequential)\n");
-            uint32_t errors = validate<float, uint32_t>(sizes[i]);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`float`: Validation (sequential)\n");
+        //     uint32_t errors = validate<float, uint32_t>(sizes[i]);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`float`: Validation (sequential argsort)\n");
-            uint32_t errors = validate<float, uint32_t>(sizes[i], true, true);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`float`: Validation (sequential argsort)\n");
+        //     uint32_t errors = validate<float, uint32_t>(sizes[i], true, true);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
         {
             printf("`float`: Validation (random)\n");
@@ -716,36 +752,36 @@ int main() {
             }
         }
 
-        {
-            printf("`float`: Validation (random argsort)\n");
-            uint32_t errors = validate<float, uint32_t>(sizes[i], false, true);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`float`: Validation (random argsort)\n");
+        //     uint32_t errors = validate<float, uint32_t>(sizes[i], false, true);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[float][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`uint8_t`: Validation (random)\n");
-            uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`uint8_t`: Validation (random)\n");
+        //     uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
-        {
-            printf("`uint8_t`: Validation (random argsort)\n");
-            uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false, true);
-            if(errors > 0) {
-                printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
-                break;
-            }
-        }
+        // {
+        //     printf("`uint8_t`: Validation (random argsort)\n");
+        //     uint32_t errors = validate<uint8_t, uint8_t>(sizes[i], false, true);
+        //     if(errors > 0) {
+        //         printf("Errors: %u while validating for size[uint8_t][%u]\n", errors, sizes[i]);
+        //         break;
+        //     }
+        // }
 
         // {
         //     printf("`float16`: Validation (random)\n");
-        //     uint32_t errors = validate<half, ushort>(sizes[i], false);
+        //     uint32_t errors = validate<__fp16, ushort>(sizes[i], false);
         //     if(errors > 0) {
         //         printf("Errors: %u while validating for size[float16][%u]\n", errors, sizes[i]);
         //         break;
@@ -754,7 +790,7 @@ int main() {
 
         // {
         //     printf("`float16`: Validation (random argsort)\n");
-        //     uint32_t errors = validate<half, ushort>(sizes[i], false, true);
+        //     uint32_t errors = validate<__fp16, ushort>(sizes[i], false, true);
         //     if(errors > 0) {
         //         printf("Errors: %u while validating for size[float16][%u]\n", errors, sizes[i]);
         //         break;
@@ -763,7 +799,7 @@ int main() {
 
         // {
         //     printf("`bfloat16`: Validation (random)\n");
-        //     uint32_t errors = validate<nv_bfloat16, ushort>(sizes[i], false);
+        //     uint32_t errors = validate<__bf16, ushort>(sizes[i], false);
         //     if(errors > 0) {
         //         printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
         //         break;
@@ -772,7 +808,7 @@ int main() {
 
         // {
         //     printf("`bfloat16`: Validation (random argsort)\n");
-        //     uint32_t errors = validate<nv_bfloat16, ushort>(sizes[i], false, true);
+        //     uint32_t errors = validate<__bf16, ushort>(sizes[i], false, true);
         //     if(errors > 0) {
         //         printf("Errors: %u while validating for size[bfloat16][%u]\n", errors, sizes[i]);
         //         break;
